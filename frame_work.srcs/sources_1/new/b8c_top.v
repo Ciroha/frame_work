@@ -1,163 +1,312 @@
 `timescale 1ns / 1ps
-//////////////////////////////////////////////////////////////////////////////////
-// Company: 
-// Engineer: 
-// 
-// Create Date: 2026/02/02 10:00:32
-// Design Name: 
-// Module Name: b8c_top
-// Project Name: 
-// Target Devices: 
-// Tool Versions: 
-// Description: 
-// 
-// Dependencies: 
-// 
-// Revision:
-// Revision 0.01 - File Created
-// Additional Comments:
-// 
-//////////////////////////////////////////////////////////////////////////////////
 
 module b8c_top #(
     parameter PARALLELISM = 8,       // 论文中的 C=8
     parameter DATA_WIDTH  = 64,      // FP64
     parameter ADDR_WIDTH  = 13,      // 8K 元素块大小
-    parameter AXI_WIDTH   = 512      // HBM 接口位宽
+    parameter AXI_WIDTH   = 512,     // HBM 接口位宽
+    // New Parameters for Loading
+    parameter VECTOR_DEPTH = 4096    // Number of 512-bit beats to load for X and Y
 )(
     input  wire clk,
     input  wire rst_n,
 
-    // --- 1. AXI4-Stream Input (来自 HBM 的 b8c 数据流) ---
-    // 包含：Matrix Values, Metadata (Row/Col indices)
-    // 实际工程中，这些通常打包在 512-bit 总线中，需要解包
+    // --- 1. AXI4-Stream Input (Main Interface) ---
+    // [Phase 1: Vector X] -> [Phase 2: Vector Y] -> [Phase 3: Matrix/Meta]
     input  wire [AXI_WIDTH-1:0]    s_axis_tdata,
     input  wire                    s_axis_tvalid,
+    input  wire                    s_axis_tlast, // Added TLAST to detect Matrix stream end
     output wire                    s_axis_tready,
 
-    // --- 2. DDR/HBM Interface for Vector Y (读/写) ---
-    // 简化为读写端口，实际需对接 AXI4 Master
-    output wire [PARALLELISM*DATA_WIDTH-1:0] m_y_wdata,
-    output wire [PARALLELISM*ADDR_WIDTH-1:0] m_y_waddr,
-    output wire [PARALLELISM-1:0]            m_y_wen,
+    // --- 2. DDR/HBM Interface for Vector Y Writeback (Output Stream) ---
+    output wire [AXI_WIDTH-1:0]    m_axis_tdata,
+    output wire                    m_axis_tvalid,
+    input  wire                    m_axis_tready,
+    output wire                    m_axis_tlast
+);
+
+    // =========================================================
+    // FSM Definitions
+    // =========================================================
+    localparam S_IDLE       = 3'd0;
+    localparam S_LOAD_X     = 3'd1;
+    localparam S_LOAD_Y     = 3'd2;
+    localparam S_COMPUTE    = 3'd3;
+    localparam S_STORE_Y    = 3'd4;
+    localparam S_DONE       = 3'd5;
     
-    // --- 3. Vector X Load Interface (预加载) ---
-    input  wire [PARALLELISM*DATA_WIDTH-1:0] s_x_preload_data,
-    input  wire [PARALLELISM*ADDR_WIDTH-1:0] s_x_preload_addr,
-    input  wire                              s_x_preload_en
-    );
-
-// =========================================================
-    // 内部信号连接
-    // =========================================================
-    // 解包后的信号
-    wire [PARALLELISM*DATA_WIDTH-1:0] matrix_values;
-    wire [PARALLELISM*16-1:0]         meta_col_indices; // 用于 X 寻址
-    wire [PARALLELISM*8-1:0]          meta_row_deltas;  // 用于结果路由
-
-    // X 向量读取结果
-    wire [PARALLELISM*DATA_WIDTH-1:0] x_read_data;
-
-    // 乘法器输出
-    wire [PARALLELISM*DATA_WIDTH-1:0] partial_products;
-    wire [PARALLELISM-1:0]            pp_valid;
-
-    // 新增信号声明
-    wire [15:0] meta_row_base;
-    wire [15:0] meta_col_base;
+    reg [2:0] state;
+    reg [ADDR_WIDTH-1:0] load_cnt;
+    
+    // Internal Signals
+    // Decoder Outputs
     wire decoder_val;
+    wire [PARALLELISM*DATA_WIDTH-1:0] dec_vals;
+    wire [PARALLELISM*16-1:0]         dec_row_deltas;
+    wire [15:0]                       dec_row_base;
+    wire [15:0]                       dec_col_base;
+    wire dec_req_next;
+    
+    // Pipeline Registers: Delay decoder outputs by 1 cycle to align with X RAM read
+    // Cycle N:   decoder_val=1, dec_vals, dec_row_deltas, dec_col_base valid
+    //            X RAM receives rd_addr (based on dec_col_base)
+    // Cycle N+1: X RAM outputs x_rd_data
+    //            dec_vals_d1, dec_row_deltas_d1 valid → compute can proceed
+    reg                               decoder_val_d1;
+    reg [PARALLELISM*DATA_WIDTH-1:0]  dec_vals_d1;
+    reg [PARALLELISM*16-1:0]          dec_row_deltas_d1;
+    reg [15:0]                        dec_row_base_d1;
+    
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            decoder_val_d1    <= 0;
+            dec_vals_d1       <= 0;
+            dec_row_deltas_d1 <= 0;
+            dec_row_base_d1   <= 0;
+        end else begin
+            decoder_val_d1    <= decoder_val;
+            dec_vals_d1       <= dec_vals;
+            dec_row_deltas_d1 <= dec_row_deltas;
+            dec_row_base_d1   <= dec_row_base;
+        end
+    end
+    
+    // Bank Signals
+    wire [PARALLELISM*DATA_WIDTH-1:0] x_rd_data;
+    wire [PARALLELISM*DATA_WIDTH-1:0] y_wb_data;
+    wire [PARALLELISM*DATA_WIDTH-1:0] y_store_data;
+    wire [PARALLELISM*16-1:0]         x_rd_addr_vec;
+    wire [PARALLELISM*ADDR_WIDTH-1:0] x_rd_addr_mapped;
+    
+    // Compute
+    wire [PARALLELISM*DATA_WIDTH-1:0] pp_data;
+    wire [PARALLELISM-1:0]            pp_valid;
+    
+    // =========================================================
+    // FSM Logic (Two-Process Style)
+    // =========================================================
+    
+    // Next state calculation (combinational)
+    reg [2:0] next_state;
+    reg [ADDR_WIDTH-1:0] next_load_cnt;
+    wire handshake = s_axis_tvalid && s_axis_tready;
+    
+    always @(*) begin
+        // Default: hold current values
+        next_state = state;
+        next_load_cnt = load_cnt;
+        
+        case (state)
+            S_IDLE: begin
+                next_load_cnt = 0;
+                if (handshake) begin
+                    next_state = S_LOAD_X;
+                    next_load_cnt = 1;  // X[0] uses addr 0, X[1] will use addr 1
+                end
+            end
+            
+            S_LOAD_X: begin
+                if (handshake) begin
+                    if (load_cnt == VECTOR_DEPTH - 1) begin
+                        // Last X beat received (X[15] when VECTOR_DEPTH=16)
+                        next_state = S_LOAD_Y;
+                        next_load_cnt = 0;  // Y[0] will use addr 0
+                    end else begin
+                        next_load_cnt = load_cnt + 1;
+                    end
+                end
+            end
+            
+            S_LOAD_Y: begin
+                if (handshake) begin
+                    if (load_cnt == VECTOR_DEPTH - 1) begin
+                        // Last Y beat received (Y[15] when VECTOR_DEPTH=16)
+                        next_state = S_COMPUTE;
+                        next_load_cnt = 0;
+                    end else begin
+                        next_load_cnt = load_cnt + 1;
+                    end
+                end
+            end
+            
+            S_COMPUTE: begin
+                if (handshake && s_axis_tlast) begin
+                    next_state = S_STORE_Y;
+                    next_load_cnt = 0;
+                end
+            end
+            
+            S_STORE_Y: begin
+                if (m_axis_tready) begin
+                    next_load_cnt = load_cnt + 1;
+                    if (load_cnt == VECTOR_DEPTH) begin
+                        next_state = S_DONE;
+                    end
+                end
+            end
+            
+            S_DONE: begin
+                next_state = S_DONE;
+            end
+        endcase
+    end
+    
+    // State register (sequential)
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            state <= S_IDLE;
+            load_cnt <= 0;
+        end else begin
+            state <= next_state;
+            load_cnt <= next_load_cnt;
+        end
+    end
+    
+    // Effective state for data path: use NEXT state when handshake occurs
+    // This allows data to be processed in the same cycle as the state transition
+    wire [2:0] effective_state = (handshake) ? next_state : state;
 
     // =========================================================
-    // 模块 1: Stream Decoder (数据解包与控制)
+    // Module Connections
     // =========================================================
-    // 作用：将 512-bit HBM 数据流拆解为 Values 和 Metadata
-    // 论文 Section III.B.4: "combine data and metadata in a single stream"
+    
+    // --- 1. Decoder (Active in COMPUTE) ---
+    // Use effective_state for immediate reaction
+    wire axis_to_dec_valid = (effective_state == S_COMPUTE) && s_axis_tvalid;
+    wire dec_ready_out;
+    
+    // s_axis_tready: Combinational logic only (no multi-driver)
+    reg s_axis_tready_comb;
+    always @(*) begin
+        case (state)
+            S_IDLE, S_LOAD_X, S_LOAD_Y: s_axis_tready_comb = 1'b1;
+            S_COMPUTE:                  s_axis_tready_comb = dec_ready_out;
+            default:                    s_axis_tready_comb = 1'b0;
+        endcase
+    end
+    assign s_axis_tready = s_axis_tready_comb;
+
     b8c_decoder #(
         .AXI_WIDTH(AXI_WIDTH),
         .PARALLELISM(PARALLELISM)
     ) u_decoder (
         .clk(clk),
         .rst_n(rst_n),
-        
-        // Input Stream
         .s_axis_tdata(s_axis_tdata),
-        .s_axis_tvalid(s_axis_tvalid),
-        .s_axis_tready(s_axis_tready),
+        .s_axis_tvalid(axis_to_dec_valid),
+        .s_axis_tready(dec_ready_out),
         
-        // Handshake / Control
-        .compute_req_next(1'b1), // Always request next data (Pipeline mode)
+        .compute_req_next(1'b1), // Always hungry for now
         .decoder_valid(decoder_val),
-        
-        // Outputs
-        .m_vals_data(matrix_values),
-        .m_row_deltas(meta_row_deltas),
-        .m_row_base(meta_row_base),
-        .m_col_base(meta_col_base)
+        .m_vals_data(dec_vals),
+        .m_row_deltas(dec_row_deltas),
+        .m_row_base(dec_row_base),
+        .m_col_base(dec_col_base)
     );
-    
-    // Logic: 生成列索引
-    // ColBase 是 Stripe 的起始列，Super-row 的 8 个元素对应 ColBase + 0 .. 7
-    genvar k;
+
+    // --- 2. X Memory Banks ---
+    // Mapping:
+    // Load: Direct linear map
+    // Read: meta_col_indices = col_base + k
+    // We simplify: just use `dec_col_base` for all.
+    // Address for Bank K = (Base + k) / 8 -> Base/8 (if Base%8==0).
+    // Let's assume Base is 64-bit aligned (element index).
+    // The provided b8c_top.v logic: `assign meta_col_indices[k*16+...] = base + k`
+    // We need to map `base+k` to `ram_addr`.
+    // Since we bank by LSB (interleaved), `addr = global_idx >> 3`.
+    genvar i;
     generate
-        for (k=0; k<PARALLELISM; k=k+1) begin : gen_col_indices
-            assign meta_col_indices[k*16 +: 16] = meta_col_base + k;
+        for(i=0; i<PARALLELISM; i=i+1) begin
+             assign x_rd_addr_mapped[i*ADDR_WIDTH +: ADDR_WIDTH] = (dec_col_base + i) >> 3; 
         end
     endgenerate
 
-    // =========================================================
-    // 模块 2: X-Vector Banked Memory (并行读取)
-    // =========================================================
-    // 作用：存储向量 X，支持并行随机读取 (Cyclic Partition)
-    // 论文 Section IV.A
     x_mem_banks #(
-        .PARALLELISM(PARALLELISM)
+        .PARALLELISM(PARALLELISM),
+        .ADDR_WIDTH(ADDR_WIDTH),
+        .DEPTH(VECTOR_DEPTH)
     ) u_x_mem (
         .clk(clk),
-        .rst_n(rst_n),
-        // 预加载端口 (Pre-fetching)
-        .wr_en({PARALLELISM{s_x_preload_en}}),
-        .wr_addr(s_x_preload_addr),
-        .wr_data(s_x_preload_data),
-        // 计算读取端口 (由 Metadata 驱动)
-        .rd_addr(meta_col_indices),
-        .rd_data(x_read_data)
+        // Load X: accepts data when in IDLE (first beat) or LOAD_X
+        .load_en(((state == S_IDLE) || (state == S_LOAD_X)) && handshake),
+        .load_addr(load_cnt),  // load_cnt holds correct address for current beat
+        .load_data(s_axis_tdata),
+        .rd_addr_vec(x_rd_addr_mapped),
+        .rd_data_vec(x_rd_data)
     );
 
-    // =========================================================
-    // 模块 3: Compute Pipeline (乘法 + 路由)
-    // =========================================================
-    // 作用：执行 A * x，并将结果路由到正确的累加器行
-    // 论文 Section IV.B: "8 x [8 x 8:1 mux]"
+    // --- 3. Compute Pipeline ---
+    // Uses delayed decoder outputs (d1) aligned with X RAM read data
     compute_pipeline #(
         .PARALLELISM(PARALLELISM)
     ) u_compute (
         .clk(clk),
-        .matrix_values(matrix_values),
-        .x_values(x_read_data),
-        .dest_row_idx(meta_row_deltas), // 控制 Mux
-        .routed_products(partial_products),
+        .matrix_values(dec_vals_d1),    // Delayed by 1 cycle
+        .x_values(x_rd_data),           // X RAM output (1 cycle after addr)
+        .dest_row_idx(dec_row_deltas_d1), // Delayed by 1 cycle
+        .routed_products(pp_data),
         .valid_mask(pp_valid)
     );
 
-    // =========================================================
-    // 模块 4: Y-Vector Accumulators (加法树 + 回写)
-    // =========================================================
-    // 作用：累加部分积，更新 Y 值
-    // 论文 Section IV.B.2 & 3
+    // --- 4. Y Accumulator / Storage ---
+    // Mode control
+    reg [1:0] y_mode;
+    // y_mode based on current state (not effective_state)
+    // This ensures data goes to correct module during state transitions
+    always @(*) begin
+        case(state)
+            S_LOAD_X: begin
+                // When transitioning LOAD_X->LOAD_Y on last beat, still use LOAD_X mode for X data
+                y_mode = 2'b00;
+            end
+            S_LOAD_Y: y_mode = 2'b01;
+            S_COMPUTE: y_mode = 2'b10;
+            S_STORE_Y: y_mode = 2'b11;
+            default: y_mode = 2'b00;
+        endcase
+    end
+    
+    // Row Delta Mapping
+    // row_deltas are relative to row_base? Or absolute?
+    // b8c implies relative. We assume `row_base + delta` is the global index.
+    // `dec_row_ Deltas` are 8-bit? Top says 8-bit in wire, decoder says 16?
+    // Let's use `dec_row_deltas` (16-bit output from decoder).
+    // Addr = (row_base + row_delta) >> 3.
+    // This requires simple address calc.
+    // We assume strict banking alignment for simplicity or just wire `row_base` into Y Acc.
+    // Actually, `y_acc_banks` expects `y_local_addr` for each bank.
+    // Let's perform the Add calculation here.
+    wire [PARALLELISM*ADDR_WIDTH-1:0] y_compute_addr;
+    generate
+        for(i=0; i<PARALLELISM; i=i+1) begin : gen_y_addr
+             wire [15:0] delta_d1 = dec_row_deltas_d1[i*16 +: 16];
+             // Addr = (Base + Delta) / 8 - use delayed signals
+             assign y_compute_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = (dec_row_base_d1 + delta_d1) >> 3;
+        end
+    endgenerate
+
     y_acc_banks #(
-        .PARALLELISM(PARALLELISM)
+        .PARALLELISM(PARALLELISM),
+        .DEPTH(VECTOR_DEPTH)
     ) u_y_acc (
         .clk(clk),
         .rst_n(rst_n),
-        .partial_products(partial_products),
-        .pp_valid(pp_valid),
-        // 简化：假设 row_deltas 同时也映射了 Y 的局部地址
-        .y_local_addr(meta_row_deltas), 
+        .mode(y_mode),
         
-        .wb_data(m_y_wdata),
-        .wb_addr(m_y_waddr),
-        .wb_en(m_y_wen)
+        // Load/Store Port - load_cnt holds correct address for current beat
+        .ls_addr(load_cnt),
+        .load_data(s_axis_tdata),
+        .store_data(y_store_data),
+        
+        // Compute Port - use delayed decoder_val for timing alignment
+        .partial_products(pp_data),
+        .pp_valid(pp_valid & {PARALLELISM{decoder_val_d1}}), // Gate with delayed valid
+        .y_local_addr(y_compute_addr)
     );
 
+    // --- 5. Output Logic ---
+    assign m_axis_tdata  = y_store_data;
+    assign m_axis_tvalid = (state == S_STORE_Y);
+    assign m_axis_tlast  = (state == S_STORE_Y) & (load_cnt == VECTOR_DEPTH - 1);
 
 endmodule
