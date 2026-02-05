@@ -49,7 +49,11 @@ module b8c_decoder #(
     output wire [15:0]                m_col_base,    // 16-bit Col Base
     
     // 全局有效信号 (当数值和解析后的元数据都准备好时置 1)
-    output wire                   decoder_valid
+    output wire                   decoder_valid,
+    
+    // Pipeline idle signal: true when val_fifo is empty
+    // This indicates ALL data has been consumed (not just currently not outputting)
+    output wire                   o_pipeline_idle
 );
 
     // 内部信号
@@ -134,5 +138,8 @@ module b8c_decoder #(
     assign m_row_deltas = parser_row_delta;
     assign m_row_base   = parser_row_base;
     assign m_col_base   = parser_col_base;
+    
+    // Pipeline idle when value FIFO is empty (all data consumed)
+    assign o_pipeline_idle = val_empty;
 
 endmodule

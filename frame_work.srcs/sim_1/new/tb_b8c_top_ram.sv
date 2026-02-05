@@ -99,6 +99,9 @@ module tb_b8c_top_ram();
                           FP64_0_0, FP64_0_0, FP64_0_0, FP64_0_0}, 
                          VECTOR_DEPTH, 0);  // No tlast
         
+        // Wait 1 cycle for FSM to transition from LOAD_Y to COMPUTE
+        @(posedge clk);
+        
         // ------------------------------------------------
         // 3. Stream Matrix (Compute) - Burst Mode
         // ------------------------------------------------

@@ -35,8 +35,14 @@ module b8c_top #(
     localparam S_STORE_Y    = 3'd4;
     localparam S_DONE       = 3'd5;
     
+    // Pipeline drain cycles after decoder FIFO empties:
+    // decoder_val_d1(1) + X_RAM_read(1) + compute_mult(1) + y_acc_write(1) = 4 cycles
+    localparam COMPUTE_DRAIN_CYCLES = 4;
+    
     reg [2:0] state;
     reg [ADDR_WIDTH-1:0] load_cnt;
+    reg tlast_seen;           // Flag: s_axis_tlast has been received
+    reg [3:0] drain_cnt;      // Counter for pipeline drain cycles (needs to count to 4)
     
     // Internal Signals
     // Decoder Outputs
@@ -51,23 +57,56 @@ module b8c_top #(
     // Cycle N:   decoder_val=1, dec_vals, dec_row_deltas, dec_col_base valid
     //            X RAM receives rd_addr (based on dec_col_base)
     // Cycle N+1: X RAM outputs x_rd_data
-    //            dec_vals_d1, dec_row_deltas_d1 valid → compute can proceed
+    //            dec_vals_d1, dec_row_deltas_d1 valid → compute receives inputs
+    // Cycle N+2: compute outputs pp_data (1 cycle multiply latency)
+    //            dec_vals_d2, dec_row_deltas_d2 valid → aligned with pp_data
+    
+    // Stage 1: Align with X RAM output
     reg                               decoder_val_d1;
     reg [PARALLELISM*DATA_WIDTH-1:0]  dec_vals_d1;
     reg [PARALLELISM*16-1:0]          dec_row_deltas_d1;
     reg [15:0]                        dec_row_base_d1;
     
+    // Stage 2: Align with compute_pipeline output (pp_data)
+    reg                               decoder_val_d2;
+    reg [PARALLELISM*16-1:0]          dec_row_deltas_d2;
+    reg [15:0]                        dec_row_base_d2;
+
+    //Stage 3: Align with compute_pipeline output (pp_data)
+    reg                               decoder_val_d3;
+    reg [PARALLELISM*16-1:0]          dec_row_deltas_d3;
+    reg [15:0]                        dec_row_base_d3;
+    
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
+            // Stage 1
             decoder_val_d1    <= 0;
             dec_vals_d1       <= 0;
             dec_row_deltas_d1 <= 0;
             dec_row_base_d1   <= 0;
+            // Stage 2
+            decoder_val_d2    <= 0;
+            dec_row_deltas_d2 <= 0;
+            dec_row_base_d2   <= 0;
+            //Stage 3
+            decoder_val_d3    <= 0;
+            dec_row_deltas_d3 <= 0;
+            dec_row_base_d3   <= 0;
+            
         end else begin
+            // Stage 1
             decoder_val_d1    <= decoder_val;
             dec_vals_d1       <= dec_vals;
             dec_row_deltas_d1 <= dec_row_deltas;
             dec_row_base_d1   <= dec_row_base;
+            // Stage 2
+            decoder_val_d2    <= decoder_val_d1;
+            dec_row_deltas_d2 <= dec_row_deltas_d1;
+            dec_row_base_d2   <= dec_row_base_d1;
+            //Stage 3
+            decoder_val_d3    <= decoder_val_d2;
+            dec_row_deltas_d3 <= dec_row_deltas_d2;
+            dec_row_base_d3   <= dec_row_base_d2;
         end
     end
     
@@ -89,16 +128,22 @@ module b8c_top #(
     // Next state calculation (combinational)
     reg [2:0] next_state;
     reg [ADDR_WIDTH-1:0] next_load_cnt;
+    reg next_tlast_seen;
+    reg [3:0] next_drain_cnt;
     wire handshake = s_axis_tvalid && s_axis_tready;
     
     always @(*) begin
         // Default: hold current values
         next_state = state;
         next_load_cnt = load_cnt;
+        next_tlast_seen = tlast_seen;
+        next_drain_cnt = drain_cnt;
         
         case (state)
             S_IDLE: begin
                 next_load_cnt = 0;
+                next_tlast_seen = 0;
+                next_drain_cnt = 0;
                 if (handshake) begin
                     next_state = S_LOAD_X;
                     next_load_cnt = 1;  // X[0] uses addr 0, X[1] will use addr 1
@@ -130,9 +175,37 @@ module b8c_top #(
             end
             
             S_COMPUTE: begin
-                if (handshake && s_axis_tlast) begin
-                    next_state = S_STORE_Y;
-                    next_load_cnt = 0;
+                // Three-phase completion logic:
+                // Phase 1: Accept input until tlast
+                // Phase 2: Wait for decoder FIFO to empty (val_fifo becomes empty)
+                // Phase 3: Wait for downstream pipeline to drain (4 cycles)
+                
+                if (!tlast_seen) begin
+                    // Phase 1: Still receiving input
+                    if (handshake && s_axis_tlast) begin
+                        next_tlast_seen = 1;
+                    end
+                end
+                else begin
+                    // Phase 2 & 3: Input done, waiting for completion
+                    // Use dec_fifo_empty (val_empty) instead of decoder_val
+                    // because decoder_val can be 0 while parser is in S_FILL state
+                    if (!dec_fifo_empty) begin
+                        // FIFO still has data - keep drain counter reset
+                        next_drain_cnt = COMPUTE_DRAIN_CYCLES;
+                    end
+                    else begin
+                        // FIFO empty - count down pipeline drain
+                        if (drain_cnt == 0) begin
+                            // Pipeline fully drained
+                            next_state = S_STORE_Y;
+                            next_load_cnt = 0;
+                            next_tlast_seen = 0;
+                        end
+                        else begin
+                            next_drain_cnt = drain_cnt - 1;
+                        end
+                    end
                 end
             end
             
@@ -156,9 +229,13 @@ module b8c_top #(
         if (!rst_n) begin
             state <= S_IDLE;
             load_cnt <= 0;
+            tlast_seen <= 0;
+            drain_cnt <= 0;
         end else begin
             state <= next_state;
             load_cnt <= next_load_cnt;
+            tlast_seen <= next_tlast_seen;
+            drain_cnt <= next_drain_cnt;
         end
     end
     
@@ -171,9 +248,11 @@ module b8c_top #(
     // =========================================================
     
     // --- 1. Decoder (Active in COMPUTE) ---
-    // Use effective_state for immediate reaction
-    wire axis_to_dec_valid = (effective_state == S_COMPUTE) && s_axis_tvalid;
+    // Use 'state' (not effective_state) to avoid sending Y data to decoder
+    // during LOAD_Y→COMPUTE transition
+    wire axis_to_dec_valid = (state == S_COMPUTE) && s_axis_tvalid;
     wire dec_ready_out;
+    wire dec_fifo_empty;  // True when decoder val_fifo is empty (all data consumed)
     
     // s_axis_tready: Combinational logic only (no multi-driver)
     reg s_axis_tready_comb;
@@ -201,7 +280,8 @@ module b8c_top #(
         .m_vals_data(dec_vals),
         .m_row_deltas(dec_row_deltas),
         .m_row_base(dec_row_base),
-        .m_col_base(dec_col_base)
+        .m_col_base(dec_col_base),
+        .o_pipeline_idle(dec_fifo_empty)
     );
 
     // --- 2. X Memory Banks ---
@@ -243,7 +323,7 @@ module b8c_top #(
         .clk(clk),
         .matrix_values(dec_vals_d1),    // Delayed by 1 cycle
         .x_values(x_rd_data),           // X RAM output (1 cycle after addr)
-        .dest_row_idx(dec_row_deltas_d1), // Delayed by 1 cycle
+        // .dest_row_idx removed - not used in compute_pipeline
         .routed_products(pp_data),
         .valid_mask(pp_valid)
     );
@@ -276,18 +356,24 @@ module b8c_top #(
     // We assume strict banking alignment for simplicity or just wire `row_base` into Y Acc.
     // Actually, `y_acc_banks` expects `y_local_addr` for each bank.
     // Let's perform the Add calculation here.
+    // Row Destination Mapping for Y accumulation
+    // Real_Row_Index[i] = RowBase + RowDelta[i]
+    // This is the actual row of Y to accumulate into
+    // NOTE: Use d2 registers to align with pp_data (compute has 1 cycle latency)
     wire [PARALLELISM*ADDR_WIDTH-1:0] y_compute_addr;
     generate
         for(i=0; i<PARALLELISM; i=i+1) begin : gen_y_addr
-             wire [15:0] delta_d1 = dec_row_deltas_d1[i*16 +: 16];
-             // Addr = (Base + Delta) / 8 - use delayed signals
-             assign y_compute_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = (dec_row_base_d1 + delta_d1) >> 3;
+             wire [15:0] delta_d3 = dec_row_deltas_d3[i*16 +: 16];
+             // Real row index = Base + Delta (no division needed)
+             assign y_compute_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = dec_row_base_d3 + delta_d3;
         end
     endgenerate
 
     y_acc_banks #(
         .PARALLELISM(PARALLELISM),
-        .DEPTH(VECTOR_DEPTH)
+        .DEPTH(VECTOR_DEPTH),
+        .DATA_WIDTH(DATA_WIDTH),
+        .ADDR_WIDTH(ADDR_WIDTH)
     ) u_y_acc (
         .clk(clk),
         .rst_n(rst_n),
@@ -298,15 +384,30 @@ module b8c_top #(
         .load_data(s_axis_tdata),
         .store_data(y_store_data),
         
-        // Compute Port - use delayed decoder_val for timing alignment
+        // Compute Port - use d2 delayed decoder_val for timing alignment with pp_data
         .partial_products(pp_data),
-        .pp_valid(pp_valid & {PARALLELISM{decoder_val_d1}}), // Gate with delayed valid
+        .pp_valid(pp_valid & {PARALLELISM{decoder_val_d3}}), // Gate with d2 valid (aligned with compute output)
         .y_local_addr(y_compute_addr)
     );
 
     // --- 5. Output Logic ---
+    // y_acc_banks has 1-cycle read latency in store mode
+    // Delay valid signal to align with actual data output
+    reg store_valid_d1;
+    reg [ADDR_WIDTH-1:0] load_cnt_d1;
+    
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            store_valid_d1 <= 0;
+            load_cnt_d1 <= 0;
+        end else begin
+            store_valid_d1 <= (state == S_STORE_Y);
+            load_cnt_d1 <= load_cnt;
+        end
+    end
+    
     assign m_axis_tdata  = y_store_data;
-    assign m_axis_tvalid = (state == S_STORE_Y);
-    assign m_axis_tlast  = (state == S_STORE_Y) & (load_cnt == VECTOR_DEPTH - 1);
+    assign m_axis_tvalid = store_valid_d1;  // Delayed by 1 cycle to match data
+    assign m_axis_tlast  = store_valid_d1 & (load_cnt_d1 == VECTOR_DEPTH - 1);
 
 endmodule

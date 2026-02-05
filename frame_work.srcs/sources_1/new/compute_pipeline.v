@@ -7,16 +7,15 @@ module compute_pipeline #(
     input  wire clk,
     input  wire [PARALLELISM*DATA_WIDTH-1:0] matrix_values,
     input  wire [PARALLELISM*DATA_WIDTH-1:0] x_values,
-    input  wire [PARALLELISM*16-1:0]         dest_row_idx, // Not used in compute, passed through or used for routing?
+    // input  wire [PARALLELISM*16-1:0]         dest_row_idx, // Not used in compute, passed through
     
     // Output routed to partial products
     output wire [PARALLELISM*DATA_WIDTH-1:0] routed_products,
     output wire [PARALLELISM-1:0]            valid_mask
 );
 
-    // Mock Compute: Just multiply
-    // In real FP64, this takes many cycles. 
-    // We will assume simplified output for connectivity check.
+    // FP64 Multiply: Use behavioral real arithmetic for simulation
+    // For synthesis: replace with Vivado FP IP (floating_point multiplier)
     
     genvar k;
     generate
@@ -24,12 +23,29 @@ module compute_pipeline #(
             wire [63:0] a = matrix_values[k*64 +: 64];
             wire [63:0] b = x_values[k*64 +: 64];
             
-            // Simplified multiplication (Integer for demo, or real * if supported)
-            // For behavioral simulation of data flow, we can just pass through or *
+            // Behavioral FP64 multiplication for simulation
             reg [63:0] prod;
-            always @(posedge clk) begin
-                prod <= a * b; // 1 cycle latency
+            
+            // synthesis translate_off
+            // Simulation only: use real arithmetic
+            real a_real, b_real, prod_real;
+            always @(*) begin
+                a_real = $bitstoreal(a);
+                b_real = $bitstoreal(b);
+                prod_real = a_real * b_real;
             end
+            
+            always @(posedge clk) begin
+                prod <= $realtobits(prod_real); // 1 cycle latency
+            end
+            // synthesis translate_on
+            
+            // synthesis code would instantiate FP IP here
+            // For now, assign prod for synthesis (will be optimized away or replaced)
+            `ifdef SYNTHESIS
+            // TODO: Instantiate Vivado floating_point IP
+            // fp_mult u_fp_mult (.aclk(clk), .s_axis_a_tdata(a), .s_axis_b_tdata(b), .m_axis_result_tdata(prod));
+            `endif
             
             assign routed_products[k*64 +: 64] = prod;
             assign valid_mask[k] = 1'b1; // Always valid if pipeline is full
