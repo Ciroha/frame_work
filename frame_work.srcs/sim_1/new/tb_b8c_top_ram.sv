@@ -5,16 +5,15 @@ module tb_b8c_top_ram();
     parameter AXI_WIDTH    = 512;
     parameter PARALLELISM  = 8;
     parameter VECTOR_DEPTH = 16; // Small depth for simulation
+    parameter Y_ELEMS      = 23; // Expected output vector elements
+    localparam Y_BEATS     = (Y_ELEMS + PARALLELISM - 1) / PARALLELISM;
 
     // =========================================================
     // FP64 Constants (IEEE 754 Double Precision)
     // =========================================================
     localparam [63:0] FP64_1_0 = 64'h3FF0_0000_0000_0000; // 1.0
     localparam [63:0] FP64_2_0 = 64'h4000_0000_0000_0000; // 2.0
-    localparam [63:0] FP64_0_5 = 64'h3FE0_0000_0000_0000; // 0.5
     localparam [63:0] FP64_0_0 = 64'h0000_0000_0000_0000; // 0.0
-    localparam [63:0] FP64_3_0 = 64'h4008_0000_0000_0000; // 3.0
-    localparam [63:0] FP64_4_0 = 64'h4010_0000_0000_0000; // 4.0
     
     logic clk;
     logic rst_n;
@@ -36,11 +35,16 @@ module tb_b8c_top_ram();
     // =========================================================
     logic [2559:0] full_meta_blob;
     
+    // Golden output for automatic checking
+    real         golden_y      [0:Y_ELEMS-1];
+    logic [63:0] golden_y_bits [0:Y_ELEMS-1];
+    
     // Instance
     b8c_top #(
         .AXI_WIDTH(AXI_WIDTH),
         .PARALLELISM(PARALLELISM),
-        .VECTOR_DEPTH(VECTOR_DEPTH)
+        .VECTOR_DEPTH(VECTOR_DEPTH),
+        .Y_ELEMS(Y_ELEMS)
     ) dut (
         .clk(clk),
         .rst_n(rst_n),
@@ -58,12 +62,23 @@ module tb_b8c_top_ram();
     always #5 clk = ~clk;
     
     initial begin
+        int error_count;
+        int beat_count;
+        int scalar_idx;
+        bit saw_tlast;
+
         clk = 0;
         rst_n = 0;
         s_axis_tvalid = 0;
         s_axis_tdata = 0;
         s_axis_tlast = 0;
         m_axis_tready = 1;
+        error_count = 0;
+        beat_count = 0;
+        scalar_idx = 0;
+        saw_tlast = 0;
+
+        build_golden_y();
         
         // Build Metadata Blob (Same pattern as tb_b8c_decode)
         // Format: {RowDeltas[7:0], ColBase, RowBase} = 160 bits per Super-row
@@ -84,9 +99,9 @@ module tb_b8c_top_ram();
         #20;
         
         // ------------------------------------------------
-        // 1. Stream X (FP64: All 1.0) - Burst Mode
+        // 1. Stream X (FP64: 1.0/2.0 alternating) - Burst Mode
         // ------------------------------------------------
-        $display("Starting Load X (Burst: %0d beats of 8x FP64 = 1.0)...", VECTOR_DEPTH);
+        $display("Starting Load X (Burst: %0d beats of 8x FP64 = 1.0/2.0 alternating)...", VECTOR_DEPTH);
         feed_burst_const({FP64_1_0, FP64_2_0, FP64_1_0, FP64_2_0,
                           FP64_1_0, FP64_2_0, FP64_1_0, FP64_2_0}, 
                          VECTOR_DEPTH, 0);  // No tlast
@@ -94,10 +109,10 @@ module tb_b8c_top_ram();
         // ------------------------------------------------
         // 2. Stream Y Initial (FP64: All 0.0) - Burst Mode
         // ------------------------------------------------
-        $display("Starting Load Y (Burst: %0d beats of 8x FP64 = 0.0)...", VECTOR_DEPTH);
+        $display("Starting Load Y (Burst: %0d beats of 8x FP64 = 0.0)...", Y_BEATS);
         feed_burst_const({FP64_0_0, FP64_0_0, FP64_0_0, FP64_0_0,
                           FP64_0_0, FP64_0_0, FP64_0_0, FP64_0_0}, 
-                         VECTOR_DEPTH, 0);  // No tlast
+                         Y_BEATS, 0);  // No tlast
         
         // Wait 1 cycle for FSM to transition from LOAD_Y to COMPUTE
         @(posedge clk);
@@ -138,39 +153,100 @@ module tb_b8c_top_ram();
         wait(m_axis_tvalid);
         
         $display("Y Writeback Started!");
-        for (int i = 0; i < VECTOR_DEPTH; i++) begin
+        while (beat_count < Y_BEATS) begin
             @(posedge clk);
             if (m_axis_tvalid && m_axis_tready) begin
-                $display("Y[%0d] = %h %h %h %h %h %h %h %h", i,
+                $display("Y[%0d] = %h %h %h %h %h %h %h %h", beat_count,
                     m_axis_tdata[64*7 +: 64], m_axis_tdata[64*6 +: 64],
                     m_axis_tdata[64*5 +: 64], m_axis_tdata[64*4 +: 64],
                     m_axis_tdata[64*3 +: 64], m_axis_tdata[64*2 +: 64],
                     m_axis_tdata[64*1 +: 64], m_axis_tdata[64*0 +: 64]);
-                if (m_axis_tlast) break;
+
+                // Check 8 scalars in lane order: lane0..lane7
+                for (int lane = 0; lane < PARALLELISM; lane++) begin
+                    logic [63:0] act;
+                    act = m_axis_tdata[lane*64 +: 64];
+                    if (scalar_idx < Y_ELEMS) begin
+                        if (act !== golden_y_bits[scalar_idx]) begin
+                            $error("Y mismatch at scalar %0d: exp=%h got=%h",
+                                   scalar_idx, golden_y_bits[scalar_idx], act);
+                            error_count++;
+                        end
+                    end else begin
+                        // Padding lanes after Y_ELEMS must be zero.
+                        if (act !== FP64_0_0) begin
+                            $error("Padding lane mismatch at scalar %0d: exp=0 got=%h",
+                                   scalar_idx, act);
+                            error_count++;
+                        end
+                    end
+                    scalar_idx++;
+                end
+
+                // TLAST must be asserted only on the final output beat.
+                if ((beat_count == Y_BEATS-1) && !m_axis_tlast) begin
+                    $error("Missing TLAST on final beat %0d", beat_count);
+                    error_count++;
+                end
+                if ((beat_count != Y_BEATS-1) && m_axis_tlast) begin
+                    $error("Unexpected TLAST on non-final beat %0d", beat_count);
+                    error_count++;
+                end
+                if (m_axis_tlast) saw_tlast = 1;
+
+                beat_count++;
             end
+        end
+
+        if (!saw_tlast) begin
+            $error("TLAST was never observed on output stream.");
+            error_count++;
+        end
+        if (scalar_idx != Y_BEATS * PARALLELISM) begin
+            $error("Output scalar count mismatch: got=%0d exp=%0d",
+                   scalar_idx, Y_BEATS * PARALLELISM);
+            error_count++;
+        end
+        if (error_count == 0) begin
+            $display("AUTO-CHECK PASSED: %0d valid scalars + %0d padding scalars",
+                     Y_ELEMS, Y_BEATS*PARALLELISM - Y_ELEMS);
+        end else begin
+            $fatal(1, "AUTO-CHECK FAILED with %0d mismatches", error_count);
         end
         
         $display("Test Done.");
         #100;
         $finish;
     end
-    
-    // Single beat transfer (with gap between beats)
-    task feed_data;
-        input [AXI_WIDTH-1:0] data;
-        input                 last;
+
+    task automatic build_golden_y;
+        real matrix_v;
+        real x_v;
+        int r;
         begin
-            @(posedge clk);
-            s_axis_tvalid <= 1;
-            s_axis_tdata <= data;
-            s_axis_tlast <= last;
-            
-            @(posedge clk);
-            while (!s_axis_tready) begin
-                @(posedge clk);
+            // Initialize with 0.0
+            for (int idx = 0; idx < Y_ELEMS; idx++) begin
+                golden_y[idx] = 0.0;
             end
-            s_axis_tvalid <= 0;
-            s_axis_tlast <= 0;
+
+            // Reconstruct expected Y for this testcase pattern:
+            // matrix row i has value 1.0 (even i) or 2.0 (odd i)
+            // lane l reads X lane value: lane even -> 2.0, lane odd -> 1.0
+            // destination row = i + l
+            for (int i = 0; i < 16; i++) begin
+                matrix_v = (i % 2 == 0) ? 1.0 : 2.0;
+                for (int lane = 0; lane < PARALLELISM; lane++) begin
+                    x_v = (lane % 2 == 0) ? 2.0 : 1.0;
+                    r = i + lane;
+                    if (r < Y_ELEMS) begin
+                        golden_y[r] = golden_y[r] + matrix_v * x_v;
+                    end
+                end
+            end
+
+            for (int idx = 0; idx < Y_ELEMS; idx++) begin
+                golden_y_bits[idx] = $realtobits(golden_y[idx]);
+            end
         end
     endtask
     

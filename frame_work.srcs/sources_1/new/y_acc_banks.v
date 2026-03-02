@@ -4,13 +4,12 @@
 // Y Accumulator for SpMV
 // ============================================================================
 // Single Y vector with parallel accumulation support
-// Handles conflict when multiple lanes target the same row
+// Behavioral model: does not resolve same-address write conflicts across lanes
 // 
 // Design:
 // - Single RAM storing Y[0..DEPTH-1]
 // - 8 parallel partial products may target different rows
-// - Conflict detection: if multiple lanes target same row, sum them first
-// - Read-Modify-Write pipeline for accumulation
+// - Read-Modify-Write style accumulation in simulation
 // ============================================================================
 
 module y_acc_banks #(
@@ -20,7 +19,6 @@ module y_acc_banks #(
     parameter ADDR_WIDTH  = $clog2(DEPTH)
 )(
     input  wire clk,
-    input  wire rst_n,
 
     // --- Mode Control ---
     // 00: Idle
@@ -56,7 +54,9 @@ module y_acc_banks #(
     always @(posedge clk) begin
         if (mode == 2'b01) begin
             for (i = 0; i < PARALLELISM; i = i + 1) begin
-                y_ram[ls_addr * PARALLELISM + i] <= load_data[i*DATA_WIDTH +: DATA_WIDTH];
+                if ((ls_addr * PARALLELISM + i) < DEPTH) begin
+                    y_ram[ls_addr * PARALLELISM + i] <= load_data[i*DATA_WIDTH +: DATA_WIDTH];
+                end
             end
         end
     end
@@ -67,7 +67,12 @@ module y_acc_banks #(
     always @(posedge clk) begin
         if (mode == 2'b11) begin
             for (i = 0; i < PARALLELISM; i = i + 1) begin
-                r_store_data[i*DATA_WIDTH +: DATA_WIDTH] <= y_ram[ls_addr * PARALLELISM + i];
+                if ((ls_addr * PARALLELISM + i) < DEPTH) begin
+                    r_store_data[i*DATA_WIDTH +: DATA_WIDTH] <= y_ram[ls_addr * PARALLELISM + i];
+                end else begin
+                    // Pad lanes beyond Y_ELEMS with zero on final beat.
+                    r_store_data[i*DATA_WIDTH +: DATA_WIDTH] <= {DATA_WIDTH{1'b0}};
+                end
             end
         end
     end
@@ -97,7 +102,7 @@ module y_acc_banks #(
     always @(posedge clk) begin
         if (mode == 2'b10) begin
             for (i = 0; i < PARALLELISM; i = i + 1) begin
-                if (pp_valid[i]) begin
+                if (pp_valid[i] && (addr[i] < DEPTH)) begin
                     // Behavioral FP add for simulation
                     y_ram[addr[i]] <= $realtobits(
                         $bitstoreal(y_ram[addr[i]]) + $bitstoreal(pp[i])

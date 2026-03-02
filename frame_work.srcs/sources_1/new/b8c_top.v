@@ -1,12 +1,13 @@
 `timescale 1ns / 1ps
 
 module b8c_top #(
-    parameter PARALLELISM = 8,       // 论文中的 C=8
+    parameter PARALLELISM = 8,       // C=8
     parameter DATA_WIDTH  = 64,      // FP64
-    parameter ADDR_WIDTH  = 13,      // 8K 元素块大小
-    parameter AXI_WIDTH   = 512,     // HBM 接口位宽
+    parameter ADDR_WIDTH  = 13,      // Address width for vector element indexing
+    parameter AXI_WIDTH   = 512,     // HBM interface width
     // New Parameters for Loading
-    parameter VECTOR_DEPTH = 4096    // Number of 512-bit beats to load for X and Y
+    parameter VECTOR_DEPTH = 4096,   // Number of 512-bit beats to load for X
+    parameter Y_ELEMS      = 23      // Number of scalar FP64 elements in output Y
 )(
     input  wire clk,
     input  wire rst_n,
@@ -38,6 +39,7 @@ module b8c_top #(
     // Pipeline drain cycles after decoder FIFO empties:
     // decoder_val_d1(1) + X_RAM_read(1) + compute_mult(1) + y_acc_write(1) = 4 cycles
     localparam COMPUTE_DRAIN_CYCLES = 4;
+    localparam integer Y_BEATS = (Y_ELEMS + PARALLELISM - 1) / PARALLELISM;
     
     reg [2:0] state;
     reg [ADDR_WIDTH-1:0] load_cnt;
@@ -51,15 +53,15 @@ module b8c_top #(
     wire [PARALLELISM*16-1:0]         dec_row_deltas;
     wire [15:0]                       dec_row_base;
     wire [15:0]                       dec_col_base;
-    wire dec_req_next;
+    wire                              dec_fifo_empty;  // True when decoder val_fifo is empty
     
     // Pipeline Registers: Delay decoder outputs by 1 cycle to align with X RAM read
     // Cycle N:   decoder_val=1, dec_vals, dec_row_deltas, dec_col_base valid
     //            X RAM receives rd_addr (based on dec_col_base)
     // Cycle N+1: X RAM outputs x_rd_data
-    //            dec_vals_d1, dec_row_deltas_d1 valid → compute receives inputs
+    //            dec_vals_d1, dec_row_deltas_d1 valid ??compute receives inputs
     // Cycle N+2: compute outputs pp_data (1 cycle multiply latency)
-    //            dec_vals_d2, dec_row_deltas_d2 valid → aligned with pp_data
+    //            dec_vals_d2, dec_row_deltas_d2 valid ??aligned with pp_data
     
     // Stage 1: Align with X RAM output
     reg                               decoder_val_d1;
@@ -112,9 +114,7 @@ module b8c_top #(
     
     // Bank Signals
     wire [PARALLELISM*DATA_WIDTH-1:0] x_rd_data;
-    wire [PARALLELISM*DATA_WIDTH-1:0] y_wb_data;
     wire [PARALLELISM*DATA_WIDTH-1:0] y_store_data;
-    wire [PARALLELISM*16-1:0]         x_rd_addr_vec;
     wire [PARALLELISM*ADDR_WIDTH-1:0] x_rd_addr_mapped;
     
     // Compute
@@ -164,8 +164,8 @@ module b8c_top #(
             
             S_LOAD_Y: begin
                 if (handshake) begin
-                    if (load_cnt == VECTOR_DEPTH - 1) begin
-                        // Last Y beat received (Y[15] when VECTOR_DEPTH=16)
+                    if (load_cnt == Y_BEATS - 1) begin
+                        // Last Y beat received (for Y_ELEMS=23, Y_BEATS=3)
                         next_state = S_COMPUTE;
                         next_load_cnt = 0;
                     end else begin
@@ -212,7 +212,7 @@ module b8c_top #(
             S_STORE_Y: begin
                 if (m_axis_tready) begin
                     next_load_cnt = load_cnt + 1;
-                    if (load_cnt == VECTOR_DEPTH) begin
+                    if (load_cnt == Y_BEATS - 1) begin
                         next_state = S_DONE;
                     end
                 end
@@ -239,20 +239,15 @@ module b8c_top #(
         end
     end
     
-    // Effective state for data path: use NEXT state when handshake occurs
-    // This allows data to be processed in the same cycle as the state transition
-    wire [2:0] effective_state = (handshake) ? next_state : state;
-
     // =========================================================
     // Module Connections
     // =========================================================
     
     // --- 1. Decoder (Active in COMPUTE) ---
-    // Use 'state' (not effective_state) to avoid sending Y data to decoder
-    // during LOAD_Y→COMPUTE transition
+    // Use current state to avoid sending Y data to decoder
+    // during LOAD_Y->COMPUTE transition
     wire axis_to_dec_valid = (state == S_COMPUTE) && s_axis_tvalid;
     wire dec_ready_out;
-    wire dec_fifo_empty;  // True when decoder val_fifo is empty (all data consumed)
     
     // s_axis_tready: Combinational logic only (no multi-driver)
     reg s_axis_tready_comb;
@@ -331,7 +326,7 @@ module b8c_top #(
     // --- 4. Y Accumulator / Storage ---
     // Mode control
     reg [1:0] y_mode;
-    // y_mode based on current state (not effective_state)
+    // y_mode based on current state
     // This ensures data goes to correct module during state transitions
     always @(*) begin
         case(state)
@@ -359,7 +354,7 @@ module b8c_top #(
     // Row Destination Mapping for Y accumulation
     // Real_Row_Index[i] = RowBase + RowDelta[i]
     // This is the actual row of Y to accumulate into
-    // NOTE: Use d2 registers to align with pp_data (compute has 1 cycle latency)
+    // NOTE: Use d3 registers to align with pp_data and Y-acc write timing
     wire [PARALLELISM*ADDR_WIDTH-1:0] y_compute_addr;
     generate
         for(i=0; i<PARALLELISM; i=i+1) begin : gen_y_addr
@@ -371,12 +366,11 @@ module b8c_top #(
 
     y_acc_banks #(
         .PARALLELISM(PARALLELISM),
-        .DEPTH(VECTOR_DEPTH),
+        .DEPTH(Y_ELEMS),
         .DATA_WIDTH(DATA_WIDTH),
         .ADDR_WIDTH(ADDR_WIDTH)
     ) u_y_acc (
         .clk(clk),
-        .rst_n(rst_n),
         .mode(y_mode),
         
         // Load/Store Port - load_cnt holds correct address for current beat
@@ -384,9 +378,9 @@ module b8c_top #(
         .load_data(s_axis_tdata),
         .store_data(y_store_data),
         
-        // Compute Port - use d2 delayed decoder_val for timing alignment with pp_data
+        // Compute Port - use d3 delayed decoder_val for timing alignment with pp_data
         .partial_products(pp_data),
-        .pp_valid(pp_valid & {PARALLELISM{decoder_val_d3}}), // Gate with d2 valid (aligned with compute output)
+        .pp_valid(pp_valid & {PARALLELISM{decoder_val_d3}}), // Gate with d3 valid (aligned with compute output)
         .y_local_addr(y_compute_addr)
     );
 
@@ -408,6 +402,7 @@ module b8c_top #(
     
     assign m_axis_tdata  = y_store_data;
     assign m_axis_tvalid = store_valid_d1;  // Delayed by 1 cycle to match data
-    assign m_axis_tlast  = store_valid_d1 & (load_cnt_d1 == VECTOR_DEPTH - 1);
+    assign m_axis_tlast  = store_valid_d1 & (load_cnt_d1 == Y_BEATS - 1);
 
 endmodule
+
