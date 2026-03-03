@@ -16,6 +16,7 @@ module compute_pipeline #(
 
     // FP64 Multiply: Use behavioral real arithmetic for simulation
     // For synthesis: replace with Vivado FP IP (floating_point multiplier)
+    //TODO replace with real fp IP/DSP
     
     genvar k;
     generate

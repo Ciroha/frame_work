@@ -97,16 +97,32 @@ module y_acc_banks #(
     endgenerate
     
     // Behavioral accumulation (simulation only)
-    // In real hardware, need proper R-M-W pipeline with conflict handling
+    // Same-cycle same-row hits are merged first, then written once.
+    // This avoids non-deterministic loss when multiple lanes target one row.
     // synthesis translate_off
+    integer j;
+    reg has_prev_hit;
+    real acc_real;
+    real add_real;
     always @(posedge clk) begin
         if (mode == 2'b10) begin
             for (i = 0; i < PARALLELISM; i = i + 1) begin
-                if (pp_valid[i] && (addr[i] < DEPTH)) begin
-                    // Behavioral FP add for simulation
-                    y_ram[addr[i]] <= $realtobits(
-                        $bitstoreal(y_ram[addr[i]]) + $bitstoreal(pp[i])
-                    );
+                has_prev_hit = 1'b0;
+                for (j = 0; j < i; j = j + 1) begin
+                    if (pp_valid[j] && (addr[j] < DEPTH) && (addr[j] == addr[i])) begin
+                        has_prev_hit = 1'b1;
+                    end
+                end
+
+                if (pp_valid[i] && (addr[i] < DEPTH) && !has_prev_hit) begin
+                    acc_real = $bitstoreal(y_ram[addr[i]]);
+                    for (j = i; j < PARALLELISM; j = j + 1) begin
+                        if (pp_valid[j] && (addr[j] < DEPTH) && (addr[j] == addr[i])) begin
+                            add_real = $bitstoreal(pp[j]);
+                            acc_real = acc_real + add_real;
+                        end
+                    end
+                    y_ram[addr[i]] <= $realtobits(acc_real);
                 end
             end
         end
