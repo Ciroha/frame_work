@@ -5,6 +5,8 @@ module b8c_top #(
     parameter DATA_WIDTH  = 64,      // FP64
     parameter ADDR_WIDTH  = 13,      // Address width for vector element indexing
     parameter AXI_WIDTH   = 512,     // HBM interface width
+    parameter MODE_ID52   = 1'b0,    // 0: legacy 16:5 FP64 stream, 1: 2:5 ID+meta stream
+    parameter LUT_INIT_FILE = "",    // LUT file used when MODE_ID52=1
     // New Parameters for Loading
     parameter VECTOR_DEPTH = 4096,   // Number of 512-bit beats to load for X
     parameter Y_ELEMS      = 23      // Number of scalar FP64 elements in output Y
@@ -248,6 +250,9 @@ module b8c_top #(
     // during LOAD_Y->COMPUTE transition
     wire axis_to_dec_valid = (state == S_COMPUTE) && s_axis_tvalid;
     wire dec_ready_out;
+    // Future-ready hook: compute side may deassert ready in hardwareized pipeline.
+    wire compute_in_ready = 1'b1;
+    wire compute_req_next = (state == S_COMPUTE) && compute_in_ready;
     
     // s_axis_tready: Combinational logic only (no multi-driver)
     reg s_axis_tready_comb;
@@ -260,24 +265,52 @@ module b8c_top #(
     end
     assign s_axis_tready = s_axis_tready_comb;
 
-    b8c_decoder #(
-        .AXI_WIDTH(AXI_WIDTH),
-        .PARALLELISM(PARALLELISM)
-    ) u_decoder (
-        .clk(clk),
-        .rst_n(rst_n),
-        .s_axis_tdata(s_axis_tdata),
-        .s_axis_tvalid(axis_to_dec_valid),
-        .s_axis_tready(dec_ready_out),
-        
-        .compute_req_next(1'b1), // Always hungry for now
-        .decoder_valid(decoder_val),
-        .m_vals_data(dec_vals),
-        .m_row_deltas(dec_row_deltas),
-        .m_row_base(dec_row_base),
-        .m_col_base(dec_col_base),
-        .o_pipeline_idle(dec_fifo_empty)
-    );
+    generate
+        if (MODE_ID52 == 1'b0) begin : gen_decoder_legacy
+            b8c_decoder #(
+                .AXI_WIDTH(AXI_WIDTH),
+                .PARALLELISM(PARALLELISM),
+                .VAL_BATCH(16),
+                .META_BATCH(5)
+            ) u_decoder (
+                .clk(clk),
+                .rst_n(rst_n),
+                .s_axis_tdata(s_axis_tdata),
+                .s_axis_tvalid(axis_to_dec_valid),
+                .s_axis_tready(dec_ready_out),
+                .compute_req_next(compute_req_next),
+                .decoder_valid(decoder_val),
+                .m_vals_data(dec_vals),
+                .m_row_deltas(dec_row_deltas),
+                .m_row_base(dec_row_base),
+                .m_col_base(dec_col_base),
+                .o_pipeline_idle(dec_fifo_empty)
+            );
+        end else begin : gen_decoder_id52
+            b8c_decoder_id52 #(
+                .AXI_WIDTH(AXI_WIDTH),
+                .PARALLELISM(PARALLELISM),
+                .VAL_ID_BATCH(2),
+                .META_BATCH(5),
+                .ID_WIDTH(8),
+                .DATA_WIDTH(DATA_WIDTH),
+                .LUT_INIT_FILE(LUT_INIT_FILE)
+            ) u_decoder (
+                .clk(clk),
+                .rst_n(rst_n),
+                .s_axis_tdata(s_axis_tdata),
+                .s_axis_tvalid(axis_to_dec_valid),
+                .s_axis_tready(dec_ready_out),
+                .compute_req_next(compute_req_next),
+                .decoder_valid(decoder_val),
+                .m_vals_data(dec_vals),
+                .m_row_deltas(dec_row_deltas),
+                .m_row_base(dec_row_base),
+                .m_col_base(dec_col_base),
+                .o_pipeline_idle(dec_fifo_empty)
+            );
+        end
+    endgenerate
 
     // --- 2. X Memory Banks ---
     // Mapping:
