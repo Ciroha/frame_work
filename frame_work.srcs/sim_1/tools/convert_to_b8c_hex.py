@@ -11,6 +11,9 @@ Outputs:
 - y_stream.hex        (AXI 512b beats for Y init load phase)
 - compute_stream.hex  (16 data beats + 5 meta beats per block)
 - golden_y.hex        (one FP64 scalar per line)
+- lut.hex             (256-entry FP64 LUT for value dictionary)
+- value_id_stream.hex (mapped CSR data IDs packed as 512b beats)
+- compute_id_stream.hex (interleaved ID+meta stream, block-wise)
 
 Notes about current RTL format constraints:
 - Column addressing is lane-local contiguous: col = col_base + lane.
@@ -24,14 +27,21 @@ import json
 import math
 import os
 import struct
+import warnings
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
+
+import numpy as np
+from scipy import io as spio
+from scipy import sparse as sp_sparse
 
 
 LANES = 8
 VAL_BATCH = 16
 META_BATCH = 5
 AXI_HEX_CHARS = 128  # 512 bits / 4
+ID_HEX_CHARS = 2
+ID_PER_AXI_BEAT = AXI_HEX_CHARS // ID_HEX_CHARS  # 64 x 8-bit IDs per 512-bit beat
 
 
 @dataclass
@@ -59,6 +69,118 @@ def pack_axi_beat_lane0_first(words_lane0_first: Sequence[int]) -> str:
     if len(s) != AXI_HEX_CHARS:
         raise RuntimeError("internal pack error: invalid AXI line width")
     return s
+
+
+def pack_axi_beat_u8_lane0_first(ids_lane0_first: Sequence[int]) -> str:
+    if len(ids_lane0_first) != ID_PER_AXI_BEAT:
+        raise ValueError(
+            f"expected {ID_PER_AXI_BEAT} ids per beat, got {len(ids_lane0_first)}"
+        )
+    lane63_to_0 = list(reversed(ids_lane0_first))
+    s = "".join(f"{(int(v) & 0xFF):02X}" for v in lane63_to_0)
+    if len(s) != AXI_HEX_CHARS:
+        raise RuntimeError("internal pack error: invalid ID AXI line width")
+    return s
+
+
+def build_value_id_stream_hex(mapped_ids: Sequence[int]) -> List[str]:
+    if not mapped_ids:
+        return []
+    lines: List[str] = []
+    for i in range(0, len(mapped_ids), ID_PER_AXI_BEAT):
+        chunk = list(mapped_ids[i : i + ID_PER_AXI_BEAT])
+        if len(chunk) < ID_PER_AXI_BEAT:
+            chunk.extend([0] * (ID_PER_AXI_BEAT - len(chunk)))
+        lines.append(pack_axi_beat_u8_lane0_first(chunk))
+    return lines
+
+
+def flatten_beat_values_lane0_first(beats: Sequence[Beat]) -> List[float]:
+    flat: List[float] = []
+    for b in beats:
+        flat.extend(b.values)  # lane0..lane7
+    return flat
+
+
+def build_value_dictionary_and_map(
+    mtx_path: str,
+    out_dir: str,
+    value_stream_values: Optional[Sequence[float]] = None,
+    lut_filename: str = "lut.hex",
+    mapped_stream_filename: str = "value_id_stream.hex",
+) -> Tuple[sp_sparse.csr_matrix, np.ndarray, Dict[int, int]]:
+    """
+    Build LUT(dictionary) and map FP64 values in CSR data to 8-bit IDs.
+
+    Rules:
+    - Unique extraction is bitwise on FP64 payload (so +0.0 and -0.0 are different IDs).
+    - NaN values are forbidden.
+    - If unique count > 256: print warning, warnings.warn, then raise ValueError.
+
+    Outputs:
+    - out_dir/lut.hex: 256 lines, each line 16-char uppercase hex (64-bit IEEE-754 bits).
+    - out_dir/value_id_stream.hex: mapped 8-bit ID stream packed into 512-bit lines.
+      If `value_stream_values` is given, this stream follows that order (used for HW-aligned stream).
+      Otherwise, it follows csr_mat.data order.
+
+    Returns:
+    - mapped_csr: CSR matrix with `data` replaced by uint8 IDs
+    - lut_u64: np.ndarray shape(256,), dtype=uint64
+    - value_to_id: Dict[fp64_bitpattern_u64 -> id]
+    """
+    mm = spio.mmread(mtx_path)
+    csr_mat = mm.tocsr() if not sp_sparse.isspmatrix_csr(mm) else mm.copy()
+
+    data_f64 = np.asarray(csr_mat.data, dtype=np.float64)
+    if np.isnan(data_f64).any():
+        raise ValueError("matrix contains NaN, which is not allowed")
+
+    data_u64 = data_f64.view(np.uint64)
+    unique_u64, inverse = np.unique(data_u64, return_inverse=True)  # sorted bit-pattern IDs from matrix data
+
+    # If stream-order values are provided, allow adding structural values not present in csr.data
+    # (e.g., padding zeros introduced during beat packing).
+    extra_u64 = np.array([], dtype=np.uint64)
+    if value_stream_values is not None:
+        stream_arr = np.asarray(value_stream_values, dtype=np.float64)
+        if np.isnan(stream_arr).any():
+            raise ValueError("value stream contains NaN, which is not allowed")
+        stream_u64 = stream_arr.view(np.uint64)
+        miss_mask = ~np.isin(stream_u64, unique_u64, assume_unique=False)
+        if miss_mask.any():
+            extra_u64 = np.unique(stream_u64[miss_mask])
+
+    final_unique = unique_u64
+    if extra_u64.size > 0:
+        final_unique = np.concatenate([unique_u64, extra_u64]).astype(np.uint64, copy=False)
+
+    if final_unique.size > 256:
+        msg = "独特值过多，超出 8-bit ID 容量"
+        print(f"Warning: {msg} (count={final_unique.size})")
+        warnings.warn(msg, RuntimeWarning)
+        raise ValueError(f"{msg}: {final_unique.size}")
+
+    lut_u64 = np.zeros(256, dtype=np.uint64)
+    lut_u64[: final_unique.size] = final_unique
+    lut_lines = [f"{int(v):016X}" for v in lut_u64]
+    write_lines(os.path.join(out_dir, lut_filename), lut_lines)
+
+    value_to_id: Dict[int, int] = {int(bits): idx for idx, bits in enumerate(final_unique.tolist())}
+
+    mapped_ids = np.fromiter((value_to_id[int(bits)] for bits in data_u64.tolist()), dtype=np.uint8)
+
+    if value_stream_values is not None:
+        stream_u64 = np.asarray(value_stream_values, dtype=np.float64).view(np.uint64)
+        stream_ids = np.fromiter((value_to_id[int(bits)] for bits in stream_u64.tolist()), dtype=np.uint8)
+        mapped_lines = build_value_id_stream_hex(stream_ids.tolist())
+    else:
+        mapped_lines = build_value_id_stream_hex(mapped_ids.tolist())
+    write_lines(os.path.join(out_dir, mapped_stream_filename), mapped_lines)
+
+    mapped_csr = csr_mat.copy()
+    mapped_csr.data = mapped_ids
+
+    return mapped_csr, lut_u64, value_to_id
 
 
 def parse_mtx(path: str) -> Tuple[int, int, List[Tuple[int, int, float]]]:
@@ -227,18 +349,62 @@ def build_compute_stream(beats: Sequence[Beat]) -> List[str]:
         for b in chunk:
             words = [f64_to_u64(v) for v in b.values]  # lane0..lane7
             lines.append(pack_axi_beat_lane0_first(words))
+        lines.extend(build_meta_lines_for_chunk(chunk))
+    return lines
 
-        blob = 0
-        for i, b in enumerate(chunk):
-            slice160 = 0
-            slice160 |= (b.row_base & 0xFFFF)
-            slice160 |= (b.col_base & 0xFFFF) << 16
-            for lane in range(LANES):
-                slice160 |= (b.row_delta[lane] & 0xFFFF) << (32 + 16 * lane)
-            blob |= slice160 << (160 * i)
-        for k in range(META_BATCH):
-            line_val = (blob >> (512 * k)) & ((1 << 512) - 1)
-            lines.append(f"{line_val:0{AXI_HEX_CHARS}X}")
+
+def build_meta_lines_for_chunk(chunk: Sequence[Beat]) -> List[str]:
+    if len(chunk) != VAL_BATCH:
+        raise ValueError(f"meta chunk must be {VAL_BATCH} beats, got {len(chunk)}")
+    blob = 0
+    for i, b in enumerate(chunk):
+        slice160 = 0
+        slice160 |= (b.row_base & 0xFFFF)
+        slice160 |= (b.col_base & 0xFFFF) << 16
+        for lane in range(LANES):
+            slice160 |= (b.row_delta[lane] & 0xFFFF) << (32 + 16 * lane)
+        blob |= slice160 << (160 * i)
+
+    lines: List[str] = []
+    for k in range(META_BATCH):
+        line_val = (blob >> (512 * k)) & ((1 << 512) - 1)
+        lines.append(f"{line_val:0{AXI_HEX_CHARS}X}")
+    return lines
+
+
+def build_compute_id_stream(beats: Sequence[Beat], value_to_id: Dict[int, int]) -> List[str]:
+    lines: List[str] = []
+    if len(beats) % VAL_BATCH != 0:
+        raise ValueError(f"beat count must be multiple of {VAL_BATCH}")
+
+    ids_per_block = VAL_BATCH * LANES
+    id_beats_per_block = math.ceil(ids_per_block / ID_PER_AXI_BEAT)
+
+    # Stream order:
+    # [ID beats for 16 value beats][5 metadata beats]...
+    for blk in range(len(beats) // VAL_BATCH):
+        chunk = beats[blk * VAL_BATCH : (blk + 1) * VAL_BATCH]
+
+        block_ids: List[int] = []
+        for b in chunk:
+            for v in b.values:  # lane0..lane7
+                bits = int(f64_to_u64(v))
+                if bits not in value_to_id:
+                    raise KeyError(f"value bits 0x{bits:016X} missing in LUT mapping")
+                block_ids.append(value_to_id[bits])
+
+        for i in range(0, len(block_ids), ID_PER_AXI_BEAT):
+            sub = block_ids[i : i + ID_PER_AXI_BEAT]
+            if len(sub) < ID_PER_AXI_BEAT:
+                sub = sub + [0] * (ID_PER_AXI_BEAT - len(sub))
+            lines.append(pack_axi_beat_u8_lane0_first(sub))
+
+        # Defensive pad, in case ids_per_block is not exactly divisible by ID_PER_AXI_BEAT.
+        while (len(lines) % (id_beats_per_block + META_BATCH)) < id_beats_per_block:
+            lines.append(pack_axi_beat_u8_lane0_first([0] * ID_PER_AXI_BEAT))
+
+        lines.extend(build_meta_lines_for_chunk(chunk))
+
     return lines
 
 
@@ -318,6 +484,20 @@ def main() -> None:
 
     beats = pad_beats_to_blocks(beats)
 
+    if args.mtx:
+        aligned_stream_vals = flatten_beat_values_lane0_first(beats)
+        mapped_csr, lut_u64, value_to_id = build_value_dictionary_and_map(
+            args.mtx,
+            args.out_dir,
+            value_stream_values=aligned_stream_vals,
+        )
+        compute_id_stream = build_compute_id_stream(beats, value_to_id)
+    else:
+        mapped_csr = None
+        lut_u64 = None
+        value_to_id = None
+        compute_id_stream = None
+
     y_elems = args.y_elems if args.y_elems is not None else m_rows
     if y_elems <= 0:
         raise ValueError("resolved y_elems <= 0, please pass --y-elems")
@@ -343,6 +523,8 @@ def main() -> None:
     write_lines(os.path.join(out_dir, "y_stream.hex"), y_stream)
     write_lines(os.path.join(out_dir, "compute_stream.hex"), compute_stream)
     write_lines(os.path.join(out_dir, "golden_y.hex"), golden_hex)
+    if compute_id_stream is not None:
+        write_lines(os.path.join(out_dir, "compute_id_stream.hex"), compute_id_stream)
 
     mat_data_beats = len(beats)
     compute_beats = len(compute_stream)
@@ -352,6 +534,18 @@ def main() -> None:
     print(f"  y_stream.hex       beats={len(y_stream)}")
     print(f"  compute_stream.hex beats={compute_beats} (data={mat_data_beats}, meta={compute_beats - mat_data_beats})")
     print(f"  golden_y.hex       scalars={len(golden_hex)}")
+    if mapped_csr is not None and lut_u64 is not None:
+        aligned_vals = len(beats) * LANES
+        id_beats = math.ceil(aligned_vals / ID_PER_AXI_BEAT)
+        blocks = len(beats) // VAL_BATCH
+        id_beats_per_block = math.ceil((VAL_BATCH * LANES) / ID_PER_AXI_BEAT)
+        compute_id_beats = blocks * (id_beats_per_block + META_BATCH)
+        print(f"  lut.hex            entries={len(lut_u64)}")
+        print(f"  value_id_stream.hex beats={id_beats} (aligned_values={aligned_vals}, nnz={mapped_csr.data.size})")
+        print(
+            f"  compute_id_stream.hex beats={compute_id_beats} "
+            f"(id={blocks*id_beats_per_block}, meta={blocks*META_BATCH})"
+        )
     print("")
     print("Suggested tb parameters:")
     print(f"  VECTOR_DEPTH = {args.vector_depth}")
