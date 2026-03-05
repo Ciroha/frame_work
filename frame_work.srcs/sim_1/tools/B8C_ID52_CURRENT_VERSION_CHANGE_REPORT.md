@@ -1,125 +1,108 @@
 # B8C ID52 当前版本修改说明（2026-03-04）
 
 ## 1. 文档目的
-本文件说明“当前工作区版本”相对上次交接后的实际修改内容、验证结果、以及仍存在的不足。
+本文件说明当前工作区版本相对上一个交接阶段的新增修改、实测结果、以及仍存在的不足。
 
-## 2. 本轮新增修改（相对上次交接）
+## 2. 本轮新增修改（核心）
 
-### 2.1 `id_unpack_parser` 吞吐改造
-文件：
+### 2.1 去除 parser 块间 1-cycle 气泡
+修改文件：
 - `frame_work.srcs/sources_1/new/id_unpack_parser.v`
-
-修改点：
-- 从单缓冲串行 `FILL -> EMIT` 改为双缓冲（`cache0/cache1` ping-pong）。
-- 引入 `fill_active/emit_active`，允许发射当前块时并行预取下一块。
-- 读请求改为连续发起（移除原先“隔拍发读”的节拍损失行为）。
-- `parser_valid` 由 `emit_active` 驱动，空闲时输出清零。
-
-效果：
-- 去掉了 parser 内部最明显的 fill/emit 硬气泡。
-
-### 2.2 `meta_parser` 吞吐改造
-文件：
 - `frame_work.srcs/sources_1/new/meta_parser.v`
 
 修改点：
-- 与 `id_unpack_parser` 同样改为双缓冲并行填充/发射。
-- 连续 FIFO 读请求（保持 FIFO 1-cycle read latency 语义）。
-- 输出切片逻辑改为从当前 `emit_bank` 动态选择。
+- 在 `emit_ptr == EMIT_COUNT-1` 的收尾拍，若对侧 bank 已 ready，直接切换 `emit_bank` 并保持 `emit_active=1`。
+- 不再先拉低 `emit_active` 再下一拍重启，消除每 16 个 token 一次的固定气泡。
+- 该改动不改变模块接口，不改变数据格式，不改变外部时序约束。
 
-效果：
-- 元数据解析不再严格“先读满再发完”，可与下一个 block 的装载重叠。
+直接收益：
+- `meta_parser` 侧“每块必停 1 拍”问题被消除，显著降低 ID/meta 配对等待。
 
-### 2.3 测试平台新增反压统计
-文件：
-- `frame_work.srcs/sim_1/new/tb_b8c_top_ram.sv`
-
-修改点：
-- 增加 compute 输入阶段 `s_axis_tready` 统计计数：
-  - `compute_ready_total_cycles`
-  - `compute_ready_high_cycles`
-  - `compute_ready_low_cycles`
-  - `ready_low_ratio`
-- 在日志中新增固定格式输出：
-  - `READY_STATS total=... high=... low=... low_ratio=...`
-- `feed_burst_array` 增加 `track_ready_stats` 参数，仅对 compute 阶段统计。
-
-效果：
-- 可以定量观察前端背压比例，不再只看总时间。
-
-### 2.4 A/B 脚本新增统计解析
-文件：
-- `frame_work.srcs/sim_1/tools/compare_mode_timing.py`
-
-修改点：
-- `SimMetrics` 新增 ready 统计字段。
-- 正则解析 `READY_STATS ...`。
-- 对比表新增：
-  - `ready_total_cycles`
-  - `ready_high_cycles`
-  - `ready_low_cycles`
-  - `ready_low_ratio`
-
-效果：
-- 可直接在 MODE0/1 报表中量化 `tready` 低占比差异。
-
-### 2.5 `b8c_decoder_id52` 当前状态说明
-文件：
+### 2.2 既有解耦能力保留（本轮未回退）
+关键文件（之前已完成，本轮继续保持）：
 - `frame_work.srcs/sources_1/new/b8c_decoder_id52.v`
+  - `DECOUPLE_ID_META` 参数化开关
+  - ID/META 队列深度参数：`ID_Q_DEPTH`、`META_Q_DEPTH`
+  - `DEC_STATS` 统计输出
+- `frame_work.srcs/sources_1/new/b8c_top.v`
+  - 解耦参数透传
+- `frame_work.srcs/sim_1/new/tb_b8c_top_ram.sv`
+  - 解耦参数透传
+  - `READY_STATS` 输出
+- `frame_work.srcs/sim_1/tools/compare_mode_timing.py`
+  - 支持传入/对比解耦与队列深度参数
+  - 解析 `READY_STATS` + `DEC_STATS`
 
-当前保留为“已验证正确”的锁步语义：
-- `consume_step = compute_req_next && decoder_valid`
-- `decoder_valid = id_valid && meta_valid`
-- `fp_vec_d1` 对齐寄存继续保留。
+## 3. 回归验证结果
 
-说明：
-- 本轮曾尝试做 ID/meta 解耦队列，但出现 `AUTO-CHECK FAILED with 967 mismatches`，已回退到正确版本。
-
-## 3. 当前验证结果
-
-执行命令：
+### 3.1 主验证点（去泡后）
+命令：
 ```powershell
-C:\IC\.venv\Scripts\python.exe frame_work.srcs/sim_1/tools/compare_mode_timing.py --prefix phase12_fix1
+C:\IC\.venv\Scripts\python.exe frame_work.srcs/sim_1/tools/compare_mode_timing.py --prefix bubblefix_d8 --decouple-id-meta 1 --id-q-depth 8 --meta-q-depth 8
 ```
 
-结果摘要（MODE0=legacy, MODE1=ID52）：
-- 功能：`pass=True / True`（均通过）
+结果（MODE0=legacy, MODE1=ID52）：
+- `pass`: `True / True`
 - `compute_beats`: `16674 -> 5558`（3.000x）
-- `feed_ns`: `166750 -> 130550`（1.277x）
-- `total_compute_to_finish_ns`: `172230 -> 140370`（1.227x）
-- MODE1 `READY_STATS`：
-  - `ready_total_cycles=13054`
-  - `ready_high_cycles=5558`
-  - `ready_low_cycles=7496`
-  - `ready_low_ratio=0.574`
+- `feed_ns`: `166750 -> 122890`（1.357x）
+- `total_compute_to_finish_ns`: `172230 -> 132450`（1.300x）
+- MODE1 `ready_low_ratio`: `0.548`
+- MODE1 `dec_pair_wait_cycles`: `5`
+- MODE1 `dec_meta_empty_cycles`: `11`
 
-日志：
-- `frame_work.sim/sim_1/behav/xsim/simulate_phase12_fix1_m0.log`
-- `frame_work.sim/sim_1/behav/xsim/simulate_phase12_fix1_m1.log`
+### 3.2 与去泡前结果对比（同为 decouple=1, q=8/8）
+去泡前（历史实测）：
+- `feed_ns = 130550`
+- `total_compute_to_finish_ns = 140380`
+- `dec_pair_wait_cycles = 798`
 
-## 4. 当前版本仍存在的不足
+去泡后（本轮）：
+- `feed_ns = 122890`（进一步缩短约 7660 ns）
+- `total_compute_to_finish_ns = 132450`（进一步缩短约 7930 ns）
+- `dec_pair_wait_cycles = 5`（基本消除）
 
-1. 2:5 优势仍未充分释放  
-虽然 `compute_beats` 下降 3x，但 `feed_ns` 仅约 `1.28x`，总时间仅约 `1.23x`。
+### 3.3 解耦开关与队列深度扫描
+命令：
+```powershell
+# lockstep
+C:\IC\.venv\Scripts\python.exe frame_work.srcs/sim_1/tools/compare_mode_timing.py --prefix bubblefix_lock --decouple-id-meta 0 --id-q-depth 8 --meta-q-depth 8
 
-2. 前端背压仍然很重  
-MODE1 的 `ready_low_ratio` 达 `0.574`，说明 compute 输入期超过一半周期在等待。
+# decouple + depth sweep
+C:\IC\.venv\Scripts\python.exe frame_work.srcs/sim_1/tools/compare_mode_timing.py --prefix bubblefix_d4  --decouple-id-meta 1 --id-q-depth 4  --meta-q-depth 4
+C:\IC\.venv\Scripts\python.exe frame_work.srcs/sim_1/tools/compare_mode_timing.py --prefix bubblefix_d8  --decouple-id-meta 1 --id-q-depth 8  --meta-q-depth 8
+C:\IC\.venv\Scripts\python.exe frame_work.srcs/sim_1/tools/compare_mode_timing.py --prefix bubblefix_d16 --decouple-id-meta 1 --id-q-depth 16 --meta-q-depth 16
+```
 
-3. ID/meta 仍是锁步消费  
-`decoder_valid = id_valid && meta_valid` 仍会被慢路径拖住；解耦方案尚未稳定落地。
+结论：
+- `decouple=0` 与 `decouple=1` 性能几乎一致（`132440ns` vs `132450ns`）。
+- `q=4/4, 8/8, 16/16` 性能几乎一致，说明当前阶段队列深度已非主瓶颈。
+- `id_full_cycles` 在小深度可很高，但不影响总吞吐（说明 ID 侧有富余）。
 
-4. `drain_ns` 变长明显  
-本次报表中 MODE1 `drain_ns=4600ns`，远高于 MODE0 `260ns`，后段排空仍需定位。
+## 4. 当前版本的优势体现（2:5）
+- 编码层面：`compute_beats` 从 `16674` 降到 `5558`，压缩比稳定 `3.000x`。
+- 系统层面：在 parser 去泡后，`total_compute_to_finish_ns` 已达到 `1.300x` 提升，显著优于此前 `~1.227x`。
+- 配对等待：`dec_pair_wait_cycles` 从约 `798` 降至 `5`，说明“前端配对卡顿”问题已基本解决。
 
-5. 覆盖范围有限  
-当前主要在 `hpcg_16-1` 场景验证；尚未对其他矩阵、边界规模做系统回归。
+## 5. 仍存在的不足与瓶颈
 
-6. 尚未做综合/时序验证  
-当前结论基于行为仿真；未给出资源与时序收敛评估。
+1. 端到端加速上限受计算主链限制（结构性瓶颈）
+- 当前计算链路本质仍以“每 token 1 cycle”推进，ID52 只减少输入 beats，不减少最终有效计算 token 数（约 12704）。
+- 因此在当前架构下，端到端速度提升不可能接近 3x，理论上限约在 `16674/12704 ≈ 1.313x`。
+- 目前实测 `1.300x` 已接近该上限。
 
-## 5. 建议下一步
+2. `ready_low_ratio` 仍高（约 0.548）
+- 这已不主要是 parser 气泡导致，而是输入流与下游消费速率耦合、FIFO 容量有限的自然结果。
+- 要再降，需要体系级改造（更深缓冲/跨阶段解耦），而非仅微调 parser。
 
-1. 以“可开关参数”方式再次实现 ID/meta 解耦（先保留锁步 fallback）。
-2. 在 decoder 内新增更细粒度计数器（ID 队列空/满、META 队列空/满、等待配对周期）。
-3. 重点压缩 `ready_low_ratio` 与 `drain_ns`，再做 A/B 验证是否接近 2:5 理论收益。
+3. `drain_ns` 仍明显高于 legacy
+- MODE1 `drain_ns ≈ 4.33us`，说明“all_data_sent -> writeback_start”阶段仍有尾部开销。
+- 可继续检查 `b8c_top` 的 `S_COMPUTE -> S_STORE_Y` 转移条件与 drain 计数策略。
 
+4. 验证覆盖与实现收敛不足
+- 当前主要在 `hpcg_16-1` 场景验证。
+- 尚未给出综合后资源、Fmax、时序收敛结论。
+
+## 6. 建议下一步
+1. 若优先稳健：默认保持 `DECOUPLE_ID_META=0`（性能已接近，逻辑更简单）。
+2. 若优先极限性能：转向 `b8c_top` 计算尾段（drain/store）与跨阶段缓冲策略，而非继续堆 parser/queue 参数。
+3. 进入实现阶段验证：补综合与时序，确认当前改动在硬件实现下无副作用。

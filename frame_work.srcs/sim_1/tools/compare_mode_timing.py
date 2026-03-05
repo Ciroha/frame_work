@@ -39,6 +39,12 @@ class SimMetrics:
     ready_high_cycles: int | None
     ready_low_cycles: int | None
     ready_low_ratio: float | None
+    dec_id_empty_cycles: int | None
+    dec_id_full_cycles: int | None
+    dec_meta_empty_cycles: int | None
+    dec_meta_full_cycles: int | None
+    dec_pair_wait_cycles: int | None
+    dec_consume_cycles: int | None
 
 
 def run_cmd(cmd: list[str], cwd: Path, env: dict[str, str]) -> None:
@@ -46,16 +52,16 @@ def run_cmd(cmd: list[str], cwd: Path, env: dict[str, str]) -> None:
     subprocess.run(cmd, cwd=str(cwd), env=env, check=True)
 
 
-def set_tb_mode(tb_file: Path, mode: int) -> None:
+def set_tb_param(tb_file: Path, param_name: str, value: str) -> None:
     txt = tb_file.read_text(encoding="utf-8")
     new_txt, n = re.subn(
-        r"(parameter\s+MODE_ID52\s*=\s*1'b)[01](\s*;)",
-        rf"\g<1>{mode}\g<2>",
+        rf"(parameter\s+{re.escape(param_name)}\s*=\s*)([^;]+)(\s*;)",
+        rf"\g<1>{value}\g<3>",
         txt,
         count=1,
     )
     if n != 1:
-        raise RuntimeError(f"failed to patch MODE_ID52 in {tb_file}")
+        raise RuntimeError(f"failed to patch parameter {param_name} in {tb_file}")
     tb_file.write_text(new_txt, encoding="utf-8")
 
 
@@ -69,6 +75,10 @@ def parse_log(mode: int, sim_log: Path) -> SimMetrics:
     finish_m = re.search(r"\$finish called at time\s*:\s*(\d+)\s*ns", txt)
     ready_m = re.search(
         r"READY_STATS\s+total=(\d+)\s+high=(\d+)\s+low=(\d+)\s+low_ratio=([0-9]*\.?[0-9]+)",
+        txt,
+    )
+    dec_stats_m = re.search(
+        r"DEC_STATS\s+id_empty=(\d+)\s+id_full=(\d+)\s+meta_empty=(\d+)\s+meta_full=(\d+)\s+pair_wait=(\d+)\s+consume=(\d+)",
         txt,
     )
     pass_m = re.search(r"AUTO-CHECK PASSED", txt)
@@ -89,6 +99,12 @@ def parse_log(mode: int, sim_log: Path) -> SimMetrics:
     ready_high_cycles = int(ready_m.group(2)) if ready_m else None
     ready_low_cycles = int(ready_m.group(3)) if ready_m else None
     ready_low_ratio = float(ready_m.group(4)) if ready_m else None
+    dec_id_empty_cycles = int(dec_stats_m.group(1)) if dec_stats_m else None
+    dec_id_full_cycles = int(dec_stats_m.group(2)) if dec_stats_m else None
+    dec_meta_empty_cycles = int(dec_stats_m.group(3)) if dec_stats_m else None
+    dec_meta_full_cycles = int(dec_stats_m.group(4)) if dec_stats_m else None
+    dec_pair_wait_cycles = int(dec_stats_m.group(5)) if dec_stats_m else None
+    dec_consume_cycles = int(dec_stats_m.group(6)) if dec_stats_m else None
 
     return SimMetrics(
         mode=mode,
@@ -109,6 +125,12 @@ def parse_log(mode: int, sim_log: Path) -> SimMetrics:
         ready_high_cycles=ready_high_cycles,
         ready_low_cycles=ready_low_cycles,
         ready_low_ratio=ready_low_ratio,
+        dec_id_empty_cycles=dec_id_empty_cycles,
+        dec_id_full_cycles=dec_id_full_cycles,
+        dec_meta_empty_cycles=dec_meta_empty_cycles,
+        dec_meta_full_cycles=dec_meta_full_cycles,
+        dec_pair_wait_cycles=dec_pair_wait_cycles,
+        dec_consume_cycles=dec_consume_cycles,
     )
 
 
@@ -143,6 +165,25 @@ def main() -> None:
         help="log/snapshot prefix",
     )
     ap.add_argument(
+        "--decouple-id-meta",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="set DECOUPLE_ID_META in testbench before runs",
+    )
+    ap.add_argument(
+        "--id-q-depth",
+        type=int,
+        default=8,
+        help="set ID_Q_DEPTH in testbench before runs",
+    )
+    ap.add_argument(
+        "--meta-q-depth",
+        type=int,
+        default=8,
+        help="set META_Q_DEPTH in testbench before runs",
+    )
+    ap.add_argument(
         "--reuse-logs",
         action="store_true",
         help="skip run; only parse existing simulate_<prefix>_m0.log and _m1.log",
@@ -172,7 +213,10 @@ def main() -> None:
         original_tb = tb_file.read_text(encoding="utf-8")
         try:
             for mode in (0, 1):
-                set_tb_mode(tb_file, mode)
+                set_tb_param(tb_file, "MODE_ID52", f"1'b{mode}")
+                set_tb_param(tb_file, "DECOUPLE_ID_META", f"1'b{args.decouple_id_meta}")
+                set_tb_param(tb_file, "ID_Q_DEPTH", str(args.id_q_depth))
+                set_tb_param(tb_file, "META_Q_DEPTH", str(args.meta_q_depth))
 
                 snapshot = f"tb_b8c_top_ram_behav_{args.prefix}_m{mode}"
                 xvlog_log = f"xvlog_{args.prefix}_m{mode}.log"
@@ -257,6 +301,10 @@ def main() -> None:
     ready_low_ratio_su = speedup(m0.ready_low_ratio, m1.ready_low_ratio)
 
     print("\n=== MODE Compare (0=legacy, 1=ID52) ===")
+    print(
+        f"Config: DECOUPLE_ID_META={args.decouple_id_meta}, "
+        f"ID_Q_DEPTH={args.id_q_depth}, META_Q_DEPTH={args.meta_q_depth}"
+    )
     print("| Metric | MODE0 | MODE1 | Speedup(M0/M1) |")
     print("|---|---:|---:|---:|")
     print(f"| pass | {m0.passed} | {m1.passed} | N/A |")
@@ -274,6 +322,12 @@ def main() -> None:
     print(f"| ready_high_cycles | {fmt(m0.ready_high_cycles)} | {fmt(m1.ready_high_cycles)} | N/A |")
     print(f"| ready_low_cycles | {fmt(m0.ready_low_cycles)} | {fmt(m1.ready_low_cycles)} | N/A |")
     print(f"| ready_low_ratio | {fmt(m0.ready_low_ratio)} | {fmt(m1.ready_low_ratio)} | {fmt(ready_low_ratio_su)} |")
+    print(f"| dec_id_empty_cycles | {fmt(m0.dec_id_empty_cycles)} | {fmt(m1.dec_id_empty_cycles)} | N/A |")
+    print(f"| dec_id_full_cycles | {fmt(m0.dec_id_full_cycles)} | {fmt(m1.dec_id_full_cycles)} | N/A |")
+    print(f"| dec_meta_empty_cycles | {fmt(m0.dec_meta_empty_cycles)} | {fmt(m1.dec_meta_empty_cycles)} | N/A |")
+    print(f"| dec_meta_full_cycles | {fmt(m0.dec_meta_full_cycles)} | {fmt(m1.dec_meta_full_cycles)} | N/A |")
+    print(f"| dec_pair_wait_cycles | {fmt(m0.dec_pair_wait_cycles)} | {fmt(m1.dec_pair_wait_cycles)} | N/A |")
+    print(f"| dec_consume_cycles | {fmt(m0.dec_consume_cycles)} | {fmt(m1.dec_consume_cycles)} | N/A |")
     print("\nLogs:")
     print(f"- MODE0: {m0.sim_log}")
     print(f"- MODE1: {m1.sim_log}")

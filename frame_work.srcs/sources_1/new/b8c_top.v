@@ -7,6 +7,9 @@ module b8c_top #(
     parameter AXI_WIDTH   = 512,     // HBM interface width
     parameter MODE_ID52   = 1'b0,    // 0: legacy 16:5 FP64 stream, 1: 2:5 ID+meta stream
     parameter LUT_INIT_FILE = "",    // LUT file used when MODE_ID52=1
+    parameter DECOUPLE_ID_META = 1'b0,
+    parameter ID_Q_DEPTH = 8,
+    parameter META_Q_DEPTH = 8,
     // New Parameters for Loading
     parameter VECTOR_DEPTH = 4096,   // Number of 512-bit beats to load for X
     parameter Y_ELEMS      = 23      // Number of scalar FP64 elements in output Y
@@ -294,7 +297,10 @@ module b8c_top #(
                 .META_BATCH(5),
                 .ID_WIDTH(8),
                 .DATA_WIDTH(DATA_WIDTH),
-                .LUT_INIT_FILE(LUT_INIT_FILE)
+                .LUT_INIT_FILE(LUT_INIT_FILE),
+                .DECOUPLE_ID_META(DECOUPLE_ID_META),
+                .ID_Q_DEPTH(ID_Q_DEPTH),
+                .META_Q_DEPTH(META_Q_DEPTH)
             ) u_decoder (
                 .clk(clk),
                 .rst_n(rst_n),

@@ -96,22 +96,36 @@ module meta_parser #(
             end
 
             // Emit current bank while the other bank can be filled.
+            // When finishing a block, directly switch to the opposite ready bank
+            // to remove the 1-cycle block-boundary bubble.
             if (emit_active && next_cycle_req) begin
                 if (emit_ptr == EMIT_COUNT-1) begin
                     if (emit_bank == 1'b0) begin
                         bank_ready0 <= 1'b0;
+                        if (bank_ready1) begin
+                            emit_active <= 1'b1;
+                            emit_bank <= 1'b1;
+                            emit_ptr <= 0;
+                        end else begin
+                            emit_active <= 1'b0;
+                            emit_ptr <= 0;
+                        end
                     end else begin
                         bank_ready1 <= 1'b0;
+                        if (bank_ready0) begin
+                            emit_active <= 1'b1;
+                            emit_bank <= 1'b0;
+                            emit_ptr <= 0;
+                        end else begin
+                            emit_active <= 1'b0;
+                            emit_ptr <= 0;
+                        end
                     end
-                    emit_active <= 1'b0;
-                    emit_ptr <= 0;
                 end else begin
                     emit_ptr <= emit_ptr + 1'b1;
                 end
-            end
-
-            // Start emit when any full bank is ready.
-            if (!emit_active) begin
+            end else if (!emit_active) begin
+                // Start emit when any full bank is ready.
                 if (bank_ready0) begin
                     emit_active <= 1'b1;
                     emit_bank <= 1'b0;

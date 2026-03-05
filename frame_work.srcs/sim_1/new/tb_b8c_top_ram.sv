@@ -5,6 +5,9 @@ module tb_b8c_top_ram();
     parameter AXI_WIDTH    = 512;
     parameter PARALLELISM  = 8;
     parameter MODE_ID52    = 1'b1;
+    parameter DECOUPLE_ID_META = 1'b0;
+    parameter ID_Q_DEPTH   = 8;
+    parameter META_Q_DEPTH = 8;
     parameter VECTOR_DEPTH = 512;   // hpcg_16-1: 4096 cols / 8 lanes
     parameter Y_ELEMS      = 4096;  // hpcg_16-1 rows
     parameter MAT_DATA_BEATS = 12704; // hpcg_16-1 data beats (multiple of 16)
@@ -65,6 +68,9 @@ module tb_b8c_top_ram();
         .PARALLELISM(PARALLELISM),
         .MODE_ID52(MODE_ID52),
         .LUT_INIT_FILE(LUT_FILE),
+        .DECOUPLE_ID_META(DECOUPLE_ID_META),
+        .ID_Q_DEPTH(ID_Q_DEPTH),
+        .META_Q_DEPTH(META_Q_DEPTH),
         .VECTOR_DEPTH(VECTOR_DEPTH),
         .Y_ELEMS(Y_ELEMS)
     ) dut (

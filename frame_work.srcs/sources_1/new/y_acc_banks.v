@@ -10,6 +10,7 @@
 // - Single RAM storing Y[0..DEPTH-1]
 // - 8 parallel partial products may target different rows
 // - Read-Modify-Write style accumulation in simulation
+// 在该模块中进行最终的累加
 // ============================================================================
 
 module y_acc_banks #(
@@ -35,7 +36,7 @@ module y_acc_banks #(
     // --- Compute/Accumulate Interface ---
     input  wire [PARALLELISM*DATA_WIDTH-1:0]   partial_products,
     input  wire [PARALLELISM-1:0]              pp_valid,
-    input  wire [PARALLELISM*ADDR_WIDTH-1:0]   y_local_addr  // Target row for each lane
+    input  wire [PARALLELISM*ADDR_WIDTH-1:0]   y_local_addr  // Target row for each lane 输入的地址
 );
 
     // =========================================================================
