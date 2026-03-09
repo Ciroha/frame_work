@@ -16,11 +16,11 @@ module meta_parser #(
     
     output reg [15:0]           out_row_base,    // 16b Base
     output reg [15:0]           out_col_base,    // 16b Col Base
-    output reg [PARALLELISM*16-1:0] out_row_delta  // 8x16b = 128b
+    output reg [PARALLELISM*16-1:0] out_row_delta
 );
     localparam META_BATCH = 5;
-    localparam OUT_W = 160;
-    localparam EMIT_COUNT = (META_BATCH * AXI_WIDTH) / OUT_W; // 16 cycles
+    localparam OUT_W = PARALLELISM * 16 + 32;
+    localparam EMIT_COUNT = (META_BATCH * AXI_WIDTH) / OUT_W;
 
     reg [AXI_WIDTH-1:0] cache0 [0:META_BATCH-1];
     reg [AXI_WIDTH-1:0] cache1 [0:META_BATCH-1];

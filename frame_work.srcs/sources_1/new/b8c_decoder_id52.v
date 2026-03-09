@@ -23,8 +23,8 @@ module b8c_decoder_id52 #(
     // Downstream consume request
     input  wire                   compute_req_next,
 
-    // Decoded outputs (kept same as legacy decoder interface)
-    output wire [AXI_WIDTH-1:0]   m_vals_data,   // 8x FP64 after LUT decode
+    // Decoded outputs
+    output wire [PARALLELISM*DATA_WIDTH-1:0] m_vals_data,   // PARALLELISM x FP64 after LUT decode
     output wire [PARALLELISM*16-1:0]  m_row_deltas,
     output wire [15:0]            m_row_base,
     output wire [15:0]            m_col_base,
@@ -346,4 +346,3 @@ module b8c_decoder_id52 #(
     end
 
 endmodule
-

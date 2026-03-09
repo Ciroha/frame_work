@@ -55,7 +55,7 @@ def run_cmd(cmd: list[str], cwd: Path, env: dict[str, str]) -> None:
 def set_tb_param(tb_file: Path, param_name: str, value: str) -> None:
     txt = tb_file.read_text(encoding="utf-8")
     new_txt, n = re.subn(
-        rf"(parameter\s+{re.escape(param_name)}\s*=\s*)([^;]+)(\s*;)",
+        rf"(parameter\s+(?:\w+\s+)?{re.escape(param_name)}\s*=\s*)([^;]+)(\s*;)",
         rf"\g<1>{value}\g<3>",
         txt,
         count=1,
@@ -184,6 +184,36 @@ def main() -> None:
         help="set META_Q_DEPTH in testbench before runs",
     )
     ap.add_argument(
+        "--parallelism",
+        type=int,
+        choices=(8, 16),
+        default=8,
+        help="set PARALLELISM in testbench before runs",
+    )
+    ap.add_argument(
+        "--vector-depth",
+        type=int,
+        default=None,
+        help="optional VECTOR_DEPTH override in testbench",
+    )
+    ap.add_argument(
+        "--y-elems",
+        type=int,
+        default=None,
+        help="optional Y_ELEMS override in testbench",
+    )
+    ap.add_argument(
+        "--mat-data-beats",
+        type=int,
+        default=None,
+        help="optional MAT_DATA_BEATS override in testbench",
+    )
+    ap.add_argument(
+        "--data-dir",
+        default=None,
+        help="optional data directory containing x_stream.hex/y_stream.hex/compute_id_stream.hex/lut.hex/golden_y.hex",
+    )
+    ap.add_argument(
         "--reuse-logs",
         action="store_true",
         help="skip run; only parse existing simulate_<prefix>_m0.log and _m1.log",
@@ -209,14 +239,31 @@ def main() -> None:
     env = os.environ.copy()
     env["PATH"] = str(vivado_bin) + os.pathsep + env.get("PATH", "")
 
+    run_modes = (0, 1) if args.parallelism == 8 else (1,)
+
     if not args.reuse_logs:
         original_tb = tb_file.read_text(encoding="utf-8")
         try:
-            for mode in (0, 1):
+            for mode in run_modes:
                 set_tb_param(tb_file, "MODE_ID52", f"1'b{mode}")
                 set_tb_param(tb_file, "DECOUPLE_ID_META", f"1'b{args.decouple_id_meta}")
                 set_tb_param(tb_file, "ID_Q_DEPTH", str(args.id_q_depth))
                 set_tb_param(tb_file, "META_Q_DEPTH", str(args.meta_q_depth))
+                set_tb_param(tb_file, "PARALLELISM", str(args.parallelism))
+                if args.vector_depth is not None:
+                    set_tb_param(tb_file, "VECTOR_DEPTH", str(args.vector_depth))
+                if args.y_elems is not None:
+                    set_tb_param(tb_file, "Y_ELEMS", str(args.y_elems))
+                if args.mat_data_beats is not None:
+                    set_tb_param(tb_file, "MAT_DATA_BEATS", str(args.mat_data_beats))
+                if args.data_dir is not None:
+                    data_dir = Path(args.data_dir).resolve().as_posix()
+                    set_tb_param(tb_file, "X_STREAM_FILE", f"\"{data_dir}/x_stream.hex\"")
+                    set_tb_param(tb_file, "Y_STREAM_FILE", f"\"{data_dir}/y_stream.hex\"")
+                    set_tb_param(tb_file, "COMPUTE_STREAM_FILE", f"\"{data_dir}/compute_stream.hex\"")
+                    set_tb_param(tb_file, "COMPUTE_ID_STREAM_FILE", f"\"{data_dir}/compute_id_stream.hex\"")
+                    set_tb_param(tb_file, "LUT_FILE", f"\"{data_dir}/lut.hex\"")
+                    set_tb_param(tb_file, "GOLDEN_Y_FILE", f"\"{data_dir}/golden_y.hex\"")
 
                 snapshot = f"tb_b8c_top_ram_behav_{args.prefix}_m{mode}"
                 xvlog_log = f"xvlog_{args.prefix}_m{mode}.log"
@@ -284,53 +331,77 @@ def main() -> None:
         finally:
             tb_file.write_text(original_tb, encoding="utf-8")
 
-    m0 = parse_log(0, xsim_dir / f"simulate_{args.prefix}_m0.log")
-    m1 = parse_log(1, xsim_dir / f"simulate_{args.prefix}_m1.log")
+    metrics_by_mode: dict[int, SimMetrics] = {
+        mode: parse_log(mode, xsim_dir / f"simulate_{args.prefix}_m{mode}.log")
+        for mode in run_modes
+    }
 
     def speedup(a: float | None, b: float | None) -> float | None:
         if a is None or b is None or b == 0:
             return None
         return a / b
 
-    all_data_su = speedup(m0.all_data_ns, m1.all_data_ns)
-    finish_su = speedup(m0.finish_ns, m1.finish_ns)
-    feed_su = speedup(m0.feed_ns, m1.feed_ns)
-    drain_su = speedup(m0.drain_ns, m1.drain_ns)
-    store_su = speedup(m0.store_check_ns, m1.store_check_ns)
-    total_su = speedup(m0.total_compute_to_finish_ns, m1.total_compute_to_finish_ns)
-    ready_low_ratio_su = speedup(m0.ready_low_ratio, m1.ready_low_ratio)
-
-    print("\n=== MODE Compare (0=legacy, 1=ID52) ===")
+    print("\n=== MODE Compare ===")
     print(
-        f"Config: DECOUPLE_ID_META={args.decouple_id_meta}, "
+        f"Config: PARALLELISM={args.parallelism}, "
+        f"DECOUPLE_ID_META={args.decouple_id_meta}, "
         f"ID_Q_DEPTH={args.id_q_depth}, META_Q_DEPTH={args.meta_q_depth}"
     )
-    print("| Metric | MODE0 | MODE1 | Speedup(M0/M1) |")
-    print("|---|---:|---:|---:|")
-    print(f"| pass | {m0.passed} | {m1.passed} | N/A |")
-    print(f"| mismatches | {fmt(m0.mismatches)} | {fmt(m1.mismatches)} | N/A |")
-    print(f"| compute_beats | {fmt(m0.compute_beats)} | {fmt(m1.compute_beats)} | {fmt(speedup(float(m0.compute_beats) if m0.compute_beats else None, float(m1.compute_beats) if m1.compute_beats else None))} |")
-    print(f"| compute_start_ns | {fmt(m0.compute_start_ns)} | {fmt(m1.compute_start_ns)} | {fmt(speedup(m0.compute_start_ns, m1.compute_start_ns))} |")
-    print(f"| all_data_ns | {fmt(m0.all_data_ns)} | {fmt(m1.all_data_ns)} | {fmt(all_data_su)} |")
-    print(f"| writeback_start_ns | {fmt(m0.writeback_start_ns)} | {fmt(m1.writeback_start_ns)} | {fmt(speedup(m0.writeback_start_ns, m1.writeback_start_ns))} |")
-    print(f"| finish_ns | {fmt(m0.finish_ns)} | {fmt(m1.finish_ns)} | {fmt(finish_su)} |")
-    print(f"| feed_ns (start->all_data) | {fmt(m0.feed_ns)} | {fmt(m1.feed_ns)} | {fmt(feed_su)} |")
-    print(f"| drain_ns (all_data->writeback) | {fmt(m0.drain_ns)} | {fmt(m1.drain_ns)} | {fmt(drain_su)} |")
-    print(f"| store_check_ns (writeback->finish) | {fmt(m0.store_check_ns)} | {fmt(m1.store_check_ns)} | {fmt(store_su)} |")
-    print(f"| total_compute_to_finish_ns | {fmt(m0.total_compute_to_finish_ns)} | {fmt(m1.total_compute_to_finish_ns)} | {fmt(total_su)} |")
-    print(f"| ready_total_cycles | {fmt(m0.ready_total_cycles)} | {fmt(m1.ready_total_cycles)} | N/A |")
-    print(f"| ready_high_cycles | {fmt(m0.ready_high_cycles)} | {fmt(m1.ready_high_cycles)} | N/A |")
-    print(f"| ready_low_cycles | {fmt(m0.ready_low_cycles)} | {fmt(m1.ready_low_cycles)} | N/A |")
-    print(f"| ready_low_ratio | {fmt(m0.ready_low_ratio)} | {fmt(m1.ready_low_ratio)} | {fmt(ready_low_ratio_su)} |")
-    print(f"| dec_id_empty_cycles | {fmt(m0.dec_id_empty_cycles)} | {fmt(m1.dec_id_empty_cycles)} | N/A |")
-    print(f"| dec_id_full_cycles | {fmt(m0.dec_id_full_cycles)} | {fmt(m1.dec_id_full_cycles)} | N/A |")
-    print(f"| dec_meta_empty_cycles | {fmt(m0.dec_meta_empty_cycles)} | {fmt(m1.dec_meta_empty_cycles)} | N/A |")
-    print(f"| dec_meta_full_cycles | {fmt(m0.dec_meta_full_cycles)} | {fmt(m1.dec_meta_full_cycles)} | N/A |")
-    print(f"| dec_pair_wait_cycles | {fmt(m0.dec_pair_wait_cycles)} | {fmt(m1.dec_pair_wait_cycles)} | N/A |")
-    print(f"| dec_consume_cycles | {fmt(m0.dec_consume_cycles)} | {fmt(m1.dec_consume_cycles)} | N/A |")
-    print("\nLogs:")
-    print(f"- MODE0: {m0.sim_log}")
-    print(f"- MODE1: {m1.sim_log}")
+
+    if run_modes == (0, 1):
+        m0 = metrics_by_mode[0]
+        m1 = metrics_by_mode[1]
+        all_data_su = speedup(m0.all_data_ns, m1.all_data_ns)
+        finish_su = speedup(m0.finish_ns, m1.finish_ns)
+        feed_su = speedup(m0.feed_ns, m1.feed_ns)
+        drain_su = speedup(m0.drain_ns, m1.drain_ns)
+        store_su = speedup(m0.store_check_ns, m1.store_check_ns)
+        total_su = speedup(m0.total_compute_to_finish_ns, m1.total_compute_to_finish_ns)
+        ready_low_ratio_su = speedup(m0.ready_low_ratio, m1.ready_low_ratio)
+
+        print("| Metric | MODE0 | MODE1 | Speedup(M0/M1) |")
+        print("|---|---:|---:|---:|")
+        print(f"| pass | {m0.passed} | {m1.passed} | N/A |")
+        print(f"| mismatches | {fmt(m0.mismatches)} | {fmt(m1.mismatches)} | N/A |")
+        print(f"| compute_beats | {fmt(m0.compute_beats)} | {fmt(m1.compute_beats)} | {fmt(speedup(float(m0.compute_beats) if m0.compute_beats else None, float(m1.compute_beats) if m1.compute_beats else None))} |")
+        print(f"| compute_start_ns | {fmt(m0.compute_start_ns)} | {fmt(m1.compute_start_ns)} | {fmt(speedup(m0.compute_start_ns, m1.compute_start_ns))} |")
+        print(f"| all_data_ns | {fmt(m0.all_data_ns)} | {fmt(m1.all_data_ns)} | {fmt(all_data_su)} |")
+        print(f"| writeback_start_ns | {fmt(m0.writeback_start_ns)} | {fmt(m1.writeback_start_ns)} | {fmt(speedup(m0.writeback_start_ns, m1.writeback_start_ns))} |")
+        print(f"| finish_ns | {fmt(m0.finish_ns)} | {fmt(m1.finish_ns)} | {fmt(finish_su)} |")
+        print(f"| feed_ns (start->all_data) | {fmt(m0.feed_ns)} | {fmt(m1.feed_ns)} | {fmt(feed_su)} |")
+        print(f"| drain_ns (all_data->writeback) | {fmt(m0.drain_ns)} | {fmt(m1.drain_ns)} | {fmt(drain_su)} |")
+        print(f"| store_check_ns (writeback->finish) | {fmt(m0.store_check_ns)} | {fmt(m1.store_check_ns)} | {fmt(store_su)} |")
+        print(f"| total_compute_to_finish_ns | {fmt(m0.total_compute_to_finish_ns)} | {fmt(m1.total_compute_to_finish_ns)} | {fmt(total_su)} |")
+        print(f"| ready_total_cycles | {fmt(m0.ready_total_cycles)} | {fmt(m1.ready_total_cycles)} | N/A |")
+        print(f"| ready_high_cycles | {fmt(m0.ready_high_cycles)} | {fmt(m1.ready_high_cycles)} | N/A |")
+        print(f"| ready_low_cycles | {fmt(m0.ready_low_cycles)} | {fmt(m1.ready_low_cycles)} | N/A |")
+        print(f"| ready_low_ratio | {fmt(m0.ready_low_ratio)} | {fmt(m1.ready_low_ratio)} | {fmt(ready_low_ratio_su)} |")
+        print(f"| dec_id_empty_cycles | {fmt(m0.dec_id_empty_cycles)} | {fmt(m1.dec_id_empty_cycles)} | N/A |")
+        print(f"| dec_id_full_cycles | {fmt(m0.dec_id_full_cycles)} | {fmt(m1.dec_id_full_cycles)} | N/A |")
+        print(f"| dec_meta_empty_cycles | {fmt(m0.dec_meta_empty_cycles)} | {fmt(m1.dec_meta_empty_cycles)} | N/A |")
+        print(f"| dec_meta_full_cycles | {fmt(m0.dec_meta_full_cycles)} | {fmt(m1.dec_meta_full_cycles)} | N/A |")
+        print(f"| dec_pair_wait_cycles | {fmt(m0.dec_pair_wait_cycles)} | {fmt(m1.dec_pair_wait_cycles)} | N/A |")
+        print(f"| dec_consume_cycles | {fmt(m0.dec_consume_cycles)} | {fmt(m1.dec_consume_cycles)} | N/A |")
+        print("\nLogs:")
+        print(f"- MODE0: {m0.sim_log}")
+        print(f"- MODE1: {m1.sim_log}")
+    else:
+        m1 = metrics_by_mode[1]
+        print("PARALLELISM=16 flow runs MODE1 only (legacy MODE0 disabled in RTL).")
+        print("| Metric | MODE1 |")
+        print("|---|---:|")
+        print(f"| pass | {m1.passed} |")
+        print(f"| mismatches | {fmt(m1.mismatches)} |")
+        print(f"| compute_beats | {fmt(m1.compute_beats)} |")
+        print(f"| all_data_ns | {fmt(m1.all_data_ns)} |")
+        print(f"| writeback_start_ns | {fmt(m1.writeback_start_ns)} |")
+        print(f"| finish_ns | {fmt(m1.finish_ns)} |")
+        print(f"| total_compute_to_finish_ns | {fmt(m1.total_compute_to_finish_ns)} |")
+        print(f"| ready_low_ratio | {fmt(m1.ready_low_ratio)} |")
+        print(f"| dec_pair_wait_cycles | {fmt(m1.dec_pair_wait_cycles)} |")
+        print(f"| dec_consume_cycles | {fmt(m1.dec_consume_cycles)} |")
+        print("\nLogs:")
+        print(f"- MODE1: {m1.sim_log}")
 
 
 if __name__ == "__main__":

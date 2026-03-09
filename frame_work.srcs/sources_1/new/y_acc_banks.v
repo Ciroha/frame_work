@@ -29,6 +29,7 @@ module y_acc_banks #(
     input  wire [1:0] mode, 
 
     // --- Load/Store Interface (Linear Access) ---
+    input  wire                                ls_en,
     input  wire [ADDR_WIDTH-1:0]               ls_addr, 
     input  wire [PARALLELISM*DATA_WIDTH-1:0]   load_data,
     output wire [PARALLELISM*DATA_WIDTH-1:0]   store_data,
@@ -53,7 +54,7 @@ module y_acc_banks #(
     // In load mode, write 8 elements starting from ls_addr * 8
     integer i;
     always @(posedge clk) begin
-        if (mode == 2'b01) begin
+        if (mode == 2'b01 && ls_en) begin
             for (i = 0; i < PARALLELISM; i = i + 1) begin
                 if ((ls_addr * PARALLELISM + i) < DEPTH) begin
                     y_ram[ls_addr * PARALLELISM + i] <= load_data[i*DATA_WIDTH +: DATA_WIDTH];
@@ -66,7 +67,7 @@ module y_acc_banks #(
     // Store Mode: Read Y values to output
     // =========================================================================
     always @(posedge clk) begin
-        if (mode == 2'b11) begin
+        if (mode == 2'b11 && ls_en) begin
             for (i = 0; i < PARALLELISM; i = i + 1) begin
                 if ((ls_addr * PARALLELISM + i) < DEPTH) begin
                     r_store_data[i*DATA_WIDTH +: DATA_WIDTH] <= y_ram[ls_addr * PARALLELISM + i];
