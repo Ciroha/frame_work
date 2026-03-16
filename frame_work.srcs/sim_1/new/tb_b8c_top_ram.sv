@@ -5,14 +5,17 @@ module tb_b8c_top_ram();
     parameter AXI_WIDTH    = 512;
     parameter PARALLELISM  = 16;
     parameter MODE_ID52    = 1'b1;
+    parameter SYMMETRIC_UPPER_ONLY = 1'b0;
     parameter DECOUPLE_ID_META = 1'b0;
     parameter ID_Q_DEPTH   = 8;
     parameter META_Q_DEPTH = 8;
-    parameter VECTOR_DEPTH = 256;   // X logical depth (addresses per lane-bank)
-    parameter Y_ELEMS      = 4096;  // hpcg_16-1 rows
-    parameter MAT_DATA_BEATS = 6352; // logical compute beats
+    parameter VECTOR_DEPTH = 256;
+    parameter Y_ELEMS      = 4096;
+    parameter MAT_DATA_BEATS = 6352;
     localparam IO_LANES       = AXI_WIDTH / 64;
     localparam LANE_RATIO     = PARALLELISM / IO_LANES;
+    localparam MAX_ADDR_ELEMS = (VECTOR_DEPTH > Y_ELEMS) ? VECTOR_DEPTH : Y_ELEMS;
+    localparam ADDR_WIDTH     = (MAX_ADDR_ELEMS <= 1) ? 1 : $clog2(MAX_ADDR_ELEMS);
     localparam X_STREAM_BEATS = VECTOR_DEPTH * LANE_RATIO;
     localparam Y_AXI_BEATS    = (Y_ELEMS + IO_LANES - 1) / IO_LANES;
     localparam META_EMIT_BEATS = (5 * AXI_WIDTH) / (PARALLELISM * 16 + 32);
@@ -31,52 +34,44 @@ module tb_b8c_top_ram();
     parameter string LUT_FILE            = "../../../../frame_work.srcs/sim_1/data/hpcg_16-1_l16/lut.hex";
     parameter string GOLDEN_Y_FILE       = "../../../../frame_work.srcs/sim_1/data/hpcg_16-1_l16/golden_y.hex";
 
-    // =========================================================
-    // FP64 Constants (IEEE 754 Double Precision)
-    // =========================================================
-    localparam [63:0] FP64_1_0 = 64'h3FF0_0000_0000_0000; // 1.0
-    localparam [63:0] FP64_2_0 = 64'h4000_0000_0000_0000; // 2.0
-    localparam [63:0] FP64_0_0 = 64'h0000_0000_0000_0000; // 0.0
-    
+    localparam [63:0] FP64_1_0 = 64'h3FF0_0000_0000_0000;
+    localparam [63:0] FP64_2_0 = 64'h4000_0000_0000_0000;
+    localparam [63:0] FP64_0_0 = 64'h0000_0000_0000_0000;
+
     logic clk;
     logic rst_n;
-    
-    // AXI Stream Inputs
+
     logic [AXI_WIDTH-1:0] s_axis_tdata;
     logic                 s_axis_tvalid;
     logic                 s_axis_tlast;
     wire                  s_axis_tready;
-    
-    // AXI Stream Outputs
+
     wire [AXI_WIDTH-1:0] m_axis_tdata;
     wire                 m_axis_tvalid;
     logic                m_axis_tready;
     wire                 m_axis_tlast;
-    
-    // Stream data loaded from hex files
+
     logic [AXI_WIDTH-1:0] x_stream_mem       [0:X_STREAM_BEATS-1];
     logic [AXI_WIDTH-1:0] y_stream_mem       [0:Y_AXI_BEATS-1];
     logic [AXI_WIDTH-1:0] compute_stream_mem [0:COMPUTE_STREAM_MEM_BEATS-1];
-    
-    // Optional golden output (one 64-bit scalar per line)
     logic [63:0] golden_y_bits [0:Y_ELEMS-1];
 
-    // Ready/backpressure stats during compute feed burst.
     int compute_ready_total_cycles;
     int compute_ready_high_cycles;
     int compute_ready_low_cycles;
-    
-    // Instance
+
     b8c_top #(
         .AXI_WIDTH(AXI_WIDTH),
         .PARALLELISM(PARALLELISM),
         .MODE_ID52(MODE_ID52),
+        .SYMMETRIC_UPPER_ONLY(SYMMETRIC_UPPER_ONLY),
         .LUT_INIT_FILE(LUT_FILE),
         .DECOUPLE_ID_META(DECOUPLE_ID_META),
         .ID_Q_DEPTH(ID_Q_DEPTH),
         .META_Q_DEPTH(META_Q_DEPTH),
         .VECTOR_DEPTH(VECTOR_DEPTH),
-        .Y_ELEMS(Y_ELEMS)
+        .Y_ELEMS(Y_ELEMS),
+        .ADDR_WIDTH(ADDR_WIDTH)
     ) dut (
         .clk(clk),
         .rst_n(rst_n),
@@ -89,10 +84,9 @@ module tb_b8c_top_ram();
         .m_axis_tready(m_axis_tready),
         .m_axis_tlast(m_axis_tlast)
     );
-    
-    // Clock
+
     always #5 clk = ~clk;
-    
+
     initial begin
         int error_count;
         int beat_count;
@@ -115,7 +109,7 @@ module tb_b8c_top_ram();
         compute_ready_total_cycles = 0;
         compute_ready_high_cycles = 0;
         compute_ready_low_cycles = 0;
-        
+
         if ((PARALLELISM % IO_LANES) != 0) begin
             $fatal(1, "PARALLELISM (%0d) must be multiple of IO_LANES (%0d)", PARALLELISM, IO_LANES);
         end
@@ -127,7 +121,6 @@ module tb_b8c_top_ram();
                    MAT_DATA_BEATS, META_EMIT_BEATS);
         end
 
-        // Load stream vectors from files.
         $readmemh(X_STREAM_FILE, x_stream_mem);
         $readmemh(Y_STREAM_FILE, y_stream_mem);
         if (MODE_ID52) begin
@@ -144,37 +137,25 @@ module tb_b8c_top_ram();
             $display("Loaded compute stream from %s", COMPUTE_STREAM_FILE);
         end
 
-        // Optional golden scalar output file.
         if (GOLDEN_Y_FILE != "") begin
             $readmemh(GOLDEN_Y_FILE, golden_y_bits);
             enable_data_check = 1;
             $display("Loaded golden Y from %s", GOLDEN_Y_FILE);
         end
-        
+
         #50;
         rst_n = 1;
         #20;
-        
-        // ------------------------------------------------
-        // 1. Stream X - Burst mode (from file)
-        // ------------------------------------------------
+
         $display("Starting Load X (Burst: %0d beats from file)...", X_STREAM_BEATS);
-        feed_burst_array(x_stream_mem, X_STREAM_BEATS, 0, 0);  // No tlast, no ready stats
-        
-        // ------------------------------------------------
-        // 2. Stream Y Initial - Burst mode (from file)
-        // ------------------------------------------------
+        feed_burst_array(x_stream_mem, X_STREAM_BEATS, 0, 0);
+
         $display("Starting Load Y (Burst: %0d beats from file)...", Y_AXI_BEATS);
-        feed_burst_array(y_stream_mem, Y_AXI_BEATS, 0, 0);  // No tlast, no ready stats
-        
-        // Wait 1 cycle for FSM to transition from LOAD_Y to COMPUTE
+        feed_burst_array(y_stream_mem, Y_AXI_BEATS, 0, 0);
+
         @(posedge clk);
-        
-        // ------------------------------------------------
-        // 3. Stream Matrix (Compute) - Burst Mode
-        // ------------------------------------------------
+
         $display("[%0t] Starting Compute Stream (Burst: %0d beats from file)...", $time, ACTIVE_COMPUTE_BEATS);
-        // Burst transfer all compute beats with tlast on final beat.
         feed_burst_array(compute_stream_mem, ACTIVE_COMPUTE_BEATS, 1, 1);
         $display("[%0t] All data sent!", $time);
         if (compute_ready_total_cycles > 0) begin
@@ -185,13 +166,10 @@ module tb_b8c_top_ram();
                      compute_ready_low_cycles,
                      ready_low_ratio);
         end
-        
-        // ------------------------------------------------
-        // 4. Wait for Store Y
-        // ------------------------------------------------
+
         $display("[%0t] Waiting for Store Y...", $time);
         wait(m_axis_tvalid);
-        
+
         $display("[%0t] Y Writeback Started!", $time);
         while (beat_count < Y_AXI_BEATS) begin
             @(posedge clk);
@@ -202,7 +180,6 @@ module tb_b8c_top_ram();
                     m_axis_tdata[64*3 +: 64], m_axis_tdata[64*2 +: 64],
                     m_axis_tdata[64*1 +: 64], m_axis_tdata[64*0 +: 64]);
 
-                // Check AXI output lanes in lane order.
                 for (int lane = 0; lane < IO_LANES; lane++) begin
                     logic [63:0] act;
                     act = m_axis_tdata[lane*64 +: 64];
@@ -213,7 +190,6 @@ module tb_b8c_top_ram();
                             error_count++;
                         end
                     end else if (scalar_idx >= Y_ELEMS) begin
-                        // Padding lanes after Y_ELEMS must be zero.
                         if (act !== FP64_0_0) begin
                             $error("Padding lane mismatch at scalar %0d: exp=0 got=%h",
                                    scalar_idx, act);
@@ -223,7 +199,6 @@ module tb_b8c_top_ram();
                     scalar_idx++;
                 end
 
-                // TLAST must be asserted only on the final output beat.
                 if ((beat_count == Y_AXI_BEATS-1) && !m_axis_tlast) begin
                     $error("Missing TLAST on final beat %0d", beat_count);
                     error_count++;
@@ -257,22 +232,21 @@ module tb_b8c_top_ram();
         end else begin
             $fatal(1, "AUTO-CHECK FAILED with %0d mismatches", error_count);
         end
-        
+
         $display("Test Done.");
         #100;
         $finish;
     end
 
-    // Burst mode: continuous transfer from array (tvalid stays high)
     task feed_burst_array;
         input logic [AXI_WIDTH-1:0] data_arr[];
         input int count;
-        input last_beat;  // Apply tlast on final beat?
+        input last_beat;
         input bit track_ready_stats;
         begin
             @(posedge clk);
             s_axis_tvalid <= 1;
-            
+
             for (int i = 0; i < count; i++) begin
                 s_axis_tdata <= data_arr[i];
                 s_axis_tlast <= (last_beat && (i == count - 1)) ? 1'b1 : 1'b0;
@@ -285,7 +259,6 @@ module tb_b8c_top_ram();
                         compute_ready_low_cycles++;
                     end
                 end
-                // Wait for handshake
                 while (!s_axis_tready) begin
                     @(posedge clk);
                     if (track_ready_stats) begin
@@ -298,7 +271,7 @@ module tb_b8c_top_ram();
                     end
                 end
             end
-            
+
             s_axis_tvalid <= 0;
             s_axis_tlast <= 0;
         end

@@ -194,7 +194,7 @@ def build_value_dictionary_and_map(
     return mapped_csr, lut_u64, value_to_id
 
 
-def parse_mtx(path: str) -> Tuple[int, int, List[Tuple[int, int, float]]]:
+def parse_mtx(path: str, symmetric_upper_only: bool = False) -> Tuple[int, int, List[Tuple[int, int, float]]]:
     entries: List[Tuple[int, int, float]] = []
     symmetric = False
     rows = cols = nnz = 0
@@ -217,6 +217,11 @@ def parse_mtx(path: str) -> Tuple[int, int, List[Tuple[int, int, float]]]:
         if len(parts) != 3:
             raise ValueError("invalid mtx size line")
         rows, cols, nnz = map(int, parts)
+        if symmetric_upper_only:
+            if not symmetric:
+                raise ValueError("--symmetric-upper-only requires MatrixMarket symmetric input")
+            if rows != cols:
+                raise ValueError("--symmetric-upper-only requires a square matrix")
 
         for _ in range(nnz):
             ln = f.readline()
@@ -229,7 +234,7 @@ def parse_mtx(path: str) -> Tuple[int, int, List[Tuple[int, int, float]]]:
             c = int(p[1]) - 1
             v = float(p[2])
             entries.append((r, c, v))
-            if symmetric and r != c:
+            if symmetric and (not symmetric_upper_only) and r != c:
                 entries.append((c, r, v))
 
     return rows, cols, entries
@@ -460,6 +465,7 @@ def compute_golden_y(
     x_vec: Sequence[float],
     y_init: Sequence[float],
     y_elems: int,
+    symmetric_upper_only: bool = False,
 ) -> List[float]:
     y = list(y_init) + [0.0] * (y_elems - len(y_init))
     for b in beats:
@@ -470,6 +476,9 @@ def compute_golden_y(
                 continue
             x = x_vec[col] if 0 <= col < len(x_vec) else 0.0
             y[row] += b.values[lane] * x
+            if symmetric_upper_only and row != col and 0 <= col < y_elems:
+                x_sym = x_vec[row] if 0 <= row < len(x_vec) else 0.0
+                y[col] += b.values[lane] * x_sym
     return y
 
 
@@ -494,6 +503,11 @@ def main() -> None:
     ap.add_argument("--y-elems", type=int, default=None, help="Y scalar length (default: max row + 1)")
     ap.add_argument("--x-file", default=None, help="optional x vector text file (one value per line)")
     ap.add_argument("--y-init-file", default=None, help="optional y init vector text file (one value per line)")
+    ap.add_argument(
+        "--symmetric-upper-only",
+        action="store_true",
+        help="for strict MatrixMarket symmetric inputs, keep only upper-triangle entries and mirror in golden/hardware",
+    )
     args = ap.parse_args()
 
     LANES = args.lanes
@@ -507,9 +521,11 @@ def main() -> None:
         raise ValueError("--vector-depth must be > 0")
 
     if args.mtx:
-        m_rows, m_cols, entries = parse_mtx(args.mtx)
+        m_rows, m_cols, entries = parse_mtx(args.mtx, symmetric_upper_only=args.symmetric_upper_only)
         beats = pack_mtx_to_beats(entries)
     else:
+        if args.symmetric_upper_only:
+            raise ValueError("--symmetric-upper-only is supported only with --mtx input")
         m_rows, m_cols, beats = load_b8c_json(args.b8c_json)
 
     beats = pad_beats_to_blocks(beats)
@@ -545,7 +561,13 @@ def main() -> None:
     y_stream = build_y_stream(y_init, y_elems)
 
     compute_stream = build_compute_stream(beats)
-    golden = compute_golden_y(beats, x_vec, y_init, y_elems)
+    golden = compute_golden_y(
+        beats,
+        x_vec,
+        y_init,
+        y_elems,
+        symmetric_upper_only=args.symmetric_upper_only,
+    )
     golden_hex = [u64_to_hex16(f64_to_u64(v)) for v in golden]
 
     out_dir = args.out_dir
@@ -586,6 +608,8 @@ def main() -> None:
     print(f"  MAT_DATA_BEATS = {mat_data_beats}")
     if compute_stream:
         print(f"  COMPUTE_BEATS  = {compute_beats}")
+    if args.symmetric_upper_only:
+        print("  SYMMETRIC_UPPER_ONLY = 1")
 
 
 if __name__ == "__main__":

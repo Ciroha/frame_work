@@ -35,10 +35,15 @@ module y_acc_banks #(
     output wire [PARALLELISM*DATA_WIDTH-1:0]   store_data,
 
     // --- Compute/Accumulate Interface ---
-    input  wire [PARALLELISM*DATA_WIDTH-1:0]   partial_products,
-    input  wire [PARALLELISM-1:0]              pp_valid,
-    input  wire [PARALLELISM*ADDR_WIDTH-1:0]   y_local_addr  // Target row for each lane 输入的地址
+    input  wire [PARALLELISM*DATA_WIDTH-1:0]   partial_products_a,
+    input  wire [PARALLELISM-1:0]              pp_valid_a,
+    input  wire [PARALLELISM*ADDR_WIDTH-1:0]   y_local_addr_a,
+    input  wire [PARALLELISM*DATA_WIDTH-1:0]   partial_products_b,
+    input  wire [PARALLELISM-1:0]              pp_valid_b,
+    input  wire [PARALLELISM*ADDR_WIDTH-1:0]   y_local_addr_b
 );
+
+    localparam UPDATE_CHANNELS = PARALLELISM * 2;
 
     // =========================================================================
     // Y RAM - Single vector storage
@@ -87,14 +92,17 @@ module y_acc_banks #(
     // In real hardware, this would need more sophisticated conflict resolution
     
     // Extract addresses and values
-    wire [ADDR_WIDTH-1:0] addr [0:PARALLELISM-1];
-    wire [DATA_WIDTH-1:0] pp   [0:PARALLELISM-1];
+    wire [UPDATE_CHANNELS*ADDR_WIDTH-1:0] y_local_addr_all = {y_local_addr_b, y_local_addr_a};
+    wire [UPDATE_CHANNELS*DATA_WIDTH-1:0] pp_all = {partial_products_b, partial_products_a};
+    wire [UPDATE_CHANNELS-1:0] pp_valid_all = {pp_valid_b, pp_valid_a};
+    wire [ADDR_WIDTH-1:0] addr [0:UPDATE_CHANNELS-1];
+    wire [DATA_WIDTH-1:0] pp   [0:UPDATE_CHANNELS-1];
     
     genvar k;
     generate
-        for (k = 0; k < PARALLELISM; k = k + 1) begin : gen_extract
-            assign addr[k] = y_local_addr[k*ADDR_WIDTH +: ADDR_WIDTH];
-            assign pp[k]   = partial_products[k*DATA_WIDTH +: DATA_WIDTH];
+        for (k = 0; k < UPDATE_CHANNELS; k = k + 1) begin : gen_extract
+            assign addr[k] = y_local_addr_all[k*ADDR_WIDTH +: ADDR_WIDTH];
+            assign pp[k]   = pp_all[k*DATA_WIDTH +: DATA_WIDTH];
         end
     endgenerate
     
@@ -108,18 +116,18 @@ module y_acc_banks #(
     real add_real;
     always @(posedge clk) begin
         if (mode == 2'b10) begin
-            for (i = 0; i < PARALLELISM; i = i + 1) begin
+            for (i = 0; i < UPDATE_CHANNELS; i = i + 1) begin
                 has_prev_hit = 1'b0;
                 for (j = 0; j < i; j = j + 1) begin
-                    if (pp_valid[j] && (addr[j] < DEPTH) && (addr[j] == addr[i])) begin
+                    if (pp_valid_all[j] && (addr[j] < DEPTH) && (addr[j] == addr[i])) begin
                         has_prev_hit = 1'b1;
                     end
                 end
 
-                if (pp_valid[i] && (addr[i] < DEPTH) && !has_prev_hit) begin
+                if (pp_valid_all[i] && (addr[i] < DEPTH) && !has_prev_hit) begin
                     acc_real = $bitstoreal(y_ram[addr[i]]);
-                    for (j = i; j < PARALLELISM; j = j + 1) begin
-                        if (pp_valid[j] && (addr[j] < DEPTH) && (addr[j] == addr[i])) begin
+                    for (j = i; j < UPDATE_CHANNELS; j = j + 1) begin
+                        if (pp_valid_all[j] && (addr[j] < DEPTH) && (addr[j] == addr[i])) begin
                             add_real = $bitstoreal(pp[j]);
                             acc_real = acc_real + add_real;
                         end

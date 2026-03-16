@@ -191,6 +191,13 @@ def main() -> None:
         help="set PARALLELISM in testbench before runs",
     )
     ap.add_argument(
+        "--symmetric-upper-only",
+        type=int,
+        choices=(0, 1),
+        default=0,
+        help="set SYMMETRIC_UPPER_ONLY in testbench before runs",
+    )
+    ap.add_argument(
         "--vector-depth",
         type=int,
         default=None,
@@ -250,6 +257,7 @@ def main() -> None:
                 set_tb_param(tb_file, "ID_Q_DEPTH", str(args.id_q_depth))
                 set_tb_param(tb_file, "META_Q_DEPTH", str(args.meta_q_depth))
                 set_tb_param(tb_file, "PARALLELISM", str(args.parallelism))
+                set_tb_param(tb_file, "SYMMETRIC_UPPER_ONLY", f"1'b{args.symmetric_upper_only}")
                 if args.vector_depth is not None:
                     set_tb_param(tb_file, "VECTOR_DEPTH", str(args.vector_depth))
                 if args.y_elems is not None:
@@ -344,6 +352,7 @@ def main() -> None:
     print("\n=== MODE Compare ===")
     print(
         f"Config: PARALLELISM={args.parallelism}, "
+        f"SYMMETRIC_UPPER_ONLY={args.symmetric_upper_only}, "
         f"DECOUPLE_ID_META={args.decouple_id_meta}, "
         f"ID_Q_DEPTH={args.id_q_depth}, META_Q_DEPTH={args.meta_q_depth}"
     )

@@ -3,15 +3,17 @@
 module b8c_top #(
     parameter PARALLELISM = 8,
     parameter DATA_WIDTH  = 64,
-    parameter ADDR_WIDTH  = 13,
     parameter AXI_WIDTH   = 512,
     parameter MODE_ID52   = 1'b0,
+    parameter SYMMETRIC_UPPER_ONLY = 1'b0,
     parameter LUT_INIT_FILE = "",
     parameter DECOUPLE_ID_META = 1'b0,
     parameter ID_Q_DEPTH = 8,
     parameter META_Q_DEPTH = 8,
     parameter VECTOR_DEPTH = 4096,
-    parameter Y_ELEMS      = 23
+    parameter Y_ELEMS      = 23,
+    parameter ADDR_WIDTH   = ((((VECTOR_DEPTH > Y_ELEMS) ? VECTOR_DEPTH : Y_ELEMS) <= 1) ?
+                              1 : $clog2((VECTOR_DEPTH > Y_ELEMS) ? VECTOR_DEPTH : Y_ELEMS))
 )(
     input  wire clk,
     input  wire rst_n,
@@ -41,6 +43,8 @@ module b8c_top #(
     localparam integer Y_LOGICAL_BEATS = (Y_ELEMS + PARALLELISM - 1) / PARALLELISM;
     localparam integer Y_AXI_BEATS = (Y_ELEMS + IO_LANES - 1) / IO_LANES;
     localparam integer COL_SHIFT = (PARALLELISM <= 1) ? 0 : $clog2(PARALLELISM);
+    localparam integer X_TOTAL_ELEMS = VECTOR_DEPTH * PARALLELISM;
+    localparam integer X_GLOBAL_AW = (X_TOTAL_ELEMS <= 1) ? 1 : $clog2(X_TOTAL_ELEMS);
 
     initial begin
         if (AXI_WIDTH % DATA_WIDTH != 0) begin
@@ -54,6 +58,9 @@ module b8c_top #(
         end
         if ((PARALLELISM == 16) && (MODE_ID52 == 1'b0)) begin
             $fatal(1, "PARALLELISM=16 is only supported for MODE_ID52=1 in this version");
+        end
+        if (SYMMETRIC_UPPER_ONLY && ((MODE_ID52 == 1'b0) || (PARALLELISM != 16))) begin
+            $fatal(1, "SYMMETRIC_UPPER_ONLY currently requires MODE_ID52=1 and PARALLELISM=16");
         end
     end
 
@@ -73,14 +80,17 @@ module b8c_top #(
     reg [PARALLELISM*DATA_WIDTH-1:0]  dec_vals_d1;
     reg [PARALLELISM*16-1:0]          dec_row_deltas_d1;
     reg [15:0]                        dec_row_base_d1;
+    reg [15:0]                        dec_col_base_d1;
 
     reg                               decoder_val_d2;
     reg [PARALLELISM*16-1:0]          dec_row_deltas_d2;
     reg [15:0]                        dec_row_base_d2;
+    reg [15:0]                        dec_col_base_d2;
 
     reg                               decoder_val_d3;
     reg [PARALLELISM*16-1:0]          dec_row_deltas_d3;
     reg [15:0]                        dec_row_base_d3;
+    reg [15:0]                        dec_col_base_d3;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -88,31 +98,41 @@ module b8c_top #(
             dec_vals_d1       <= {PARALLELISM*DATA_WIDTH{1'b0}};
             dec_row_deltas_d1 <= {PARALLELISM*16{1'b0}};
             dec_row_base_d1   <= 16'd0;
+            dec_col_base_d1   <= 16'd0;
             decoder_val_d2    <= 1'b0;
             dec_row_deltas_d2 <= {PARALLELISM*16{1'b0}};
             dec_row_base_d2   <= 16'd0;
+            dec_col_base_d2   <= 16'd0;
             decoder_val_d3    <= 1'b0;
             dec_row_deltas_d3 <= {PARALLELISM*16{1'b0}};
             dec_row_base_d3   <= 16'd0;
+            dec_col_base_d3   <= 16'd0;
         end else begin
             decoder_val_d1    <= decoder_val;
             dec_vals_d1       <= dec_vals;
             dec_row_deltas_d1 <= dec_row_deltas;
             dec_row_base_d1   <= dec_row_base;
+            dec_col_base_d1   <= dec_col_base;
             decoder_val_d2    <= decoder_val_d1;
             dec_row_deltas_d2 <= dec_row_deltas_d1;
             dec_row_base_d2   <= dec_row_base_d1;
+            dec_col_base_d2   <= dec_col_base_d1;
             decoder_val_d3    <= decoder_val_d2;
             dec_row_deltas_d3 <= dec_row_deltas_d2;
             dec_row_base_d3   <= dec_row_base_d2;
+            dec_col_base_d3   <= dec_col_base_d2;
         end
     end
 
     wire [PARALLELISM*DATA_WIDTH-1:0] x_rd_data;
+    wire [PARALLELISM*DATA_WIDTH-1:0] x_sym_rd_data;
     wire [PARALLELISM*DATA_WIDTH-1:0] y_store_data;
     wire [PARALLELISM*ADDR_WIDTH-1:0] x_rd_addr_mapped;
-    wire [PARALLELISM*DATA_WIDTH-1:0] pp_data;
-    wire [PARALLELISM-1:0]            pp_valid;
+    wire [PARALLELISM*X_GLOBAL_AW-1:0] x_sym_rd_addr_global;
+    wire [PARALLELISM*DATA_WIDTH-1:0] pp_data_main;
+    wire [PARALLELISM*DATA_WIDTH-1:0] pp_data_sym;
+    wire [PARALLELISM-1:0]            pp_valid_main;
+    wire [PARALLELISM-1:0]            pp_valid_sym;
 
     reg [2:0]  next_state;
     reg [31:0] next_load_cnt;
@@ -286,7 +306,15 @@ module b8c_top #(
     genvar i;
     generate
         for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_x_addr
-            assign x_rd_addr_mapped[i*ADDR_WIDTH +: ADDR_WIDTH] = (dec_col_base + i) >> COL_SHIFT;
+            assign x_rd_addr_mapped[i*ADDR_WIDTH +: ADDR_WIDTH] = (dec_col_base_d1 + i) >> COL_SHIFT;
+        end
+    endgenerate
+
+    generate
+        for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_x_sym_addr
+            wire [15:0] sym_delta = dec_row_deltas_d1[i*16 +: 16];
+            wire [15:0] sym_row_abs = dec_row_base_d1 + sym_delta;
+            assign x_sym_rd_addr_global[i*X_GLOBAL_AW +: X_GLOBAL_AW] = sym_row_abs[X_GLOBAL_AW-1:0];
         end
     endgenerate
 
@@ -316,14 +344,17 @@ module b8c_top #(
     x_mem_banks #(
         .PARALLELISM(PARALLELISM),
         .ADDR_WIDTH(ADDR_WIDTH),
-        .DEPTH(VECTOR_DEPTH)
+        .DEPTH(VECTOR_DEPTH),
+        .GLOBAL_ADDR_WIDTH(X_GLOBAL_AW)
     ) u_x_mem (
         .clk(clk),
         .load_en(x_load_fire),
         .load_addr(x_load_addr_full[ADDR_WIDTH-1:0]),
         .load_data(x_load_data_w),
         .rd_addr_vec(x_rd_addr_mapped),
-        .rd_data_vec(x_rd_data)
+        .rd_data_vec(x_rd_data),
+        .arb_rd_global_idx_vec(x_sym_rd_addr_global),
+        .arb_rd_data_vec(x_sym_rd_data)
     );
 
     compute_pipeline #(
@@ -331,9 +362,12 @@ module b8c_top #(
     ) u_compute (
         .clk(clk),
         .matrix_values(dec_vals_d1),
-        .x_values(x_rd_data),
-        .routed_products(pp_data),
-        .valid_mask(pp_valid)
+        .x_values_main(x_rd_data),
+        .x_values_sym(x_sym_rd_data),
+        .routed_products_main(pp_data_main),
+        .routed_products_sym(pp_data_sym),
+        .valid_mask_main(pp_valid_main),
+        .valid_mask_sym(pp_valid_sym)
     );
 
     reg [1:0] y_mode;
@@ -347,10 +381,16 @@ module b8c_top #(
     end
 
     wire [PARALLELISM*ADDR_WIDTH-1:0] y_compute_addr;
+    wire [PARALLELISM*ADDR_WIDTH-1:0] y_compute_addr_sym;
+    wire [PARALLELISM-1:0]            y_sym_diag_mask;
     generate
         for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_y_addr
             wire [15:0] delta_d3 = dec_row_deltas_d3[i*16 +: 16];
-            assign y_compute_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = dec_row_base_d3 + delta_d3;
+            wire [15:0] row_abs_d3 = dec_row_base_d3 + delta_d3;
+            wire [15:0] col_abs_d3 = dec_col_base_d3 + i;
+            assign y_compute_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = row_abs_d3[ADDR_WIDTH-1:0];
+            assign y_compute_addr_sym[i*ADDR_WIDTH +: ADDR_WIDTH] = col_abs_d3[ADDR_WIDTH-1:0];
+            assign y_sym_diag_mask[i] = (row_abs_d3 == col_abs_d3);
         end
     endgenerate
 
@@ -449,9 +489,12 @@ module b8c_top #(
         .ls_addr(y_ls_addr),
         .load_data(y_load_data_w),
         .store_data(y_store_data),
-        .partial_products(pp_data),
-        .pp_valid(pp_valid & {PARALLELISM{decoder_val_d3}}),
-        .y_local_addr(y_compute_addr)
+        .partial_products_a(pp_data_main),
+        .pp_valid_a(pp_valid_main & {PARALLELISM{decoder_val_d3}}),
+        .y_local_addr_a(y_compute_addr),
+        .partial_products_b(pp_data_sym),
+        .pp_valid_b(pp_valid_sym & {PARALLELISM{decoder_val_d3 & SYMMETRIC_UPPER_ONLY}} & ~y_sym_diag_mask),
+        .y_local_addr_b(y_compute_addr_sym)
     );
 
     assign m_axis_tdata  = y_store_axi_word;
