@@ -1,76 +1,79 @@
 `timescale 1ns / 1ps
 //////////////////////////////////////////////////////////////////////////////////
-// Company: 
-// Engineer: 
-// 
-// Create Date: 2026/02/02 11:16:54
-// Design Name: 
-// Module Name: b8c_decode
-// Project Name: 
-// Target Devices: 
-// Tool Versions: 
-// Description: 
-// 
-// Dependencies: 
-// 
-// Revision:
-// Revision 0.01 - File Created
-// Additional Comments:
-// 
+// Module: b8c_decoder
+//////////////////////////////////////////////////////////////////////////////////
+// 功能描述:
+//   SpMV解码器模块 - 传统模式
+//   将混合的数据流(16拍FP64数据 + 5拍元数据)拆分并解码为计算所需的格式
+//
+// 数据格式:
+//   输入: [FP64数据拍 x 16] [元数据拍 x 5] ... (重复)
+//   输出: 8个FP64矩阵值 + 8个行偏移 + 行基址 + 列基址 (每拍)
+//
+// 架构:
+//   1. stream_demux: 流解复用器，将数据流分离为数值流和元数据流
+//   2. 双FIFO: 分别缓存数值和元数据
+//   3. meta_parser: 元数据解析器，将5拍元数据扩展为16拍控制信号
+//
+// 元数据格式(每160位):
+//   [15:0]   row_base    - 行基址
+//   [31:16]  col_base    - 列基址
+//   [159:32] row_deltas  - 8个行偏移量(每个16位)
 //////////////////////////////////////////////////////////////////////////////////
 
 module b8c_decoder #(
-    parameter AXI_WIDTH   = 512, // HBM Interface Width
-    parameter PARALLELISM = 8,   // C=8 (8 parallel lanes)
-    parameter VAL_BATCH   = 16,  // 16 lines of Values
-    parameter META_BATCH  = 5    // 5 lines of Metadata
+    // ========================================================================
+    // 参数定义
+    // ========================================================================
+    parameter AXI_WIDTH   = 512,   // HBM接口位宽(512位)
+    parameter PARALLELISM = 8,     // 并行度(C=8, 8个并行计算通道)
+    parameter VAL_BATCH   = 16,    // 数值批大小(16拍FP64数据)
+    parameter META_BATCH  = 5      // 元数据批大小(5拍元数据)
 )(
     input  wire                   clk,
     input  wire                   rst_n,
 
-    // --- 1. Input: Combined Stream form HBM (Values + Metadata) ---
+    // --- 1. 输入接口: 来自HBM的混合流 (数值 + 元数据) ---
     input  wire [AXI_WIDTH-1:0]   s_axis_tdata,
     input  wire                   s_axis_tvalid,
     output wire                   s_axis_tready,
 
-    // --- 2. Output: Decoded Streams to Compute Pipeline ---
+    // --- 2. 输出接口: 解码后的数据送计算流水线 ---
     // 下游计算单元请求下一拍数据
-    input  wire                   compute_req_next, 
-    
-    // 输出给乘法器的矩阵数值
-    output wire [AXI_WIDTH-1:0]   m_vals_data,   // 8x FP64
-    
-    // 输出给 X Memory 的列索引 (用于寻址)
-    // output wire [PARALLELISM*16-1:0] m_col_indices, // REMOVED
-    
-    // 输出给 Accumulator 的行偏移 (用于路由)
-    output wire [PARALLELISM*16-1:0]  m_row_deltas,  // 8x 16-bit
-    output wire [15:0]                m_row_base,    // 16-bit Base
-    output wire [15:0]                m_col_base,    // 16-bit Col Base
-    
-    // 全局有效信号 (当数值和解析后的元数据都准备好时置 1)
+    input  wire                   compute_req_next,
+
+    // 输出给乘法器的矩阵数值 (8个FP64)
+    output wire [AXI_WIDTH-1:0]   m_vals_data,
+
+    // 输出给Accumulator的行偏移 (用于路由)
+    output wire [PARALLELISM*16-1:0]  m_row_deltas,  // 8x 16-bit行偏移
+    output wire [15:0]                m_row_base,    // 16-bit行基址
+    output wire [15:0]                m_col_base,    // 16-bit列基址
+
+    // 全局有效信号 (当数值和解析后的元数据都准备好时置1)
     output wire                   decoder_valid,
-    
-    // Pipeline idle signal: true when val_fifo is empty
-    // This indicates ALL data has been consumed (not just currently not outputting)
+
+    // 流水线空闲信号: 数值FIFO为空时表示所有数据已消费
     output wire                   o_pipeline_idle
 );
 
-    // 内部信号
-    wire [AXI_WIDTH-1:0] val_fifo_din, val_fifo_dout;
-    wire [AXI_WIDTH-1:0] meta_fifo_din, meta_fifo_dout;
-    wire val_wen, val_full, val_empty, val_ren;
-    wire meta_wen, meta_full, meta_empty, meta_ren;
-    
-    wire parser_ready;
-    wire [15:0]               parser_row_base;
-    wire [15:0]               parser_col_base;
-    wire [PARALLELISM*16-1:0] parser_row_delta;
+    // ========================================================================
+    // 内部信号定义
+    // ========================================================================
+    wire [AXI_WIDTH-1:0] val_fifo_din, val_fifo_dout;  // 数值FIFO数据
+    wire [AXI_WIDTH-1:0] meta_fifo_din, meta_fifo_dout; // 元数据FIFO数据
+    wire val_wen, val_full, val_empty, val_ren;        // 数值FIFO控制信号
+    wire meta_wen, meta_full, meta_empty, meta_ren;    // 元数据FIFO控制信号
+
+    wire parser_ready;                                  // 解析器就绪信号
+    wire [15:0]               parser_row_base;         // 解析后的行基址
+    wire [15:0]               parser_col_base;         // 解析后的列基址
+    wire [PARALLELISM*16-1:0] parser_row_delta;        // 解析后的行偏移数组
 
     // =========================================================
-    // Sub-module 1: Stream Demux (16 Data : 5 Metadata)
+    // 子模块1: 流解复用器 (16数据 : 5元数据)
     // =========================================================
-    // 负责将混合流拆分写入两个 FIFO
+    // 功能: 将混合流按照16:5的比例拆分写入两个FIFO
     stream_demux #(
         .AXI_WIDTH(AXI_WIDTH),
         .VAL_BATCH(VAL_BATCH),
@@ -86,16 +89,16 @@ module b8c_decoder #(
     );
 
     // =========================================================
-    // Sub-module 2: Dual FIFOs
+    // 子模块2: 双FIFO缓存
     // =========================================================
-    // Values FIFO (深度较大，因为数据量大)
+    // 数值FIFO - 深度较大(512),因为数据量大(16/21 ≈ 76%)
     simple_sync_fifo #(.WIDTH(AXI_WIDTH), .DEPTH(512)) u_fifo_vals (
         .clk(clk), .rst_n(rst_n),
         .wen(val_wen), .din(val_fifo_din), .full(val_full),
         .ren(val_ren), .dout(val_fifo_dout), .empty(val_empty)
     );
 
-    // Metadata FIFO (深度较小，因为只有 5/16 的量)
+    // 元数据FIFO - 深度较小(128),因为数据量小(5/21 ≈ 24%)
     simple_sync_fifo #(.WIDTH(AXI_WIDTH), .DEPTH(128)) u_fifo_meta (
         .clk(clk), .rst_n(rst_n),
         .wen(meta_wen), .din(meta_fifo_din), .full(meta_full),
@@ -103,9 +106,10 @@ module b8c_decoder #(
     );
 
     // =========================================================
-    // Sub-module 3: Metadata Parser (The Expander)
+    // 子模块3: 元数据解析器 (扩展器)
     // =========================================================
-    // 负责从 Meta FIFO 读 5 行，吐出 16 行控制信号
+    // 功能: 从Meta FIFO读取5拍数据,输出16拍控制信号
+    // 解析格式: 每拍160位 = {row_base, col_base, row_deltas[7:0]}
     meta_parser #(
         .AXI_WIDTH(AXI_WIDTH),
         .PARALLELISM(PARALLELISM)
@@ -124,22 +128,21 @@ module b8c_decoder #(
     );
 
     // =========================================================
-    // Output Logic & Handshake
+    // 输出逻辑与握手控制
     // =========================================================
-    // 只有当 Data FIFO 有数，且 Parser 解析完毕时，输出才有效
+    // 只有当数值FIFO有数据且解析器准备好时,输出才有效
     assign decoder_valid = (!val_empty) && parser_ready;
-    
-    // 当下游请求数据，且我们也准备好了时，读取 FIFO 并推进 Parser
+
+    // 当下游请求数据且我们也准备好时,读取FIFO并推进解析器
     assign val_ren = compute_req_next && decoder_valid;
 
     // 输出赋值
-    assign m_vals_data = val_fifo_dout;
-    // assign m_col_indices = parser_col_idx;
-    assign m_row_deltas = parser_row_delta;
-    assign m_row_base   = parser_row_base;
-    assign m_col_base   = parser_col_base;
-    
-    // Pipeline idle when value FIFO is empty (all data consumed)
+    assign m_vals_data = val_fifo_dout;      // 数值直接从FIFO输出
+    assign m_row_deltas = parser_row_delta;  // 行偏移从解析器输出
+    assign m_row_base   = parser_row_base;   // 行基址从解析器输出
+    assign m_col_base   = parser_col_base;   // 列基址从解析器输出
+
+    // 流水线空闲: 数值FIFO为空表示所有数据已消费完毕
     assign o_pipeline_idle = val_empty;
 
 endmodule

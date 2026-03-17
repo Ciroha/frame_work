@@ -1,5 +1,31 @@
 `timescale 1ns / 1ps
 
+// ============================================================================
+// Module: b8c_decoder_id52
+// 功能描述:
+//   SpMV解码器模块 - ID压缩模式
+//   将混合的数据流(2拍8位ID + 5拍元数据)拆分并解码为计算所需的格式
+//
+// 数据格式:
+//   输入: [ID拍 x 2] [元数据拍 x 5] ... (重复)
+//   输出: 8/16个FP64矩阵值 + 行偏移 + 行基址 + 列基址 (每拍)
+//
+// 架构:
+//   1. stream_demux_id52: 流解复用器,将数据流分离为ID流和元数据流
+//   2. 双FIFO: 分别缓存ID和元数据
+//   3. id_unpack_parser: ID解包解析器,将2拍ID扩展为16拍
+//   4. meta_parser: 元数据解析器,将5拍元数据扩展为16拍
+//   5. value_lut_decode: 值LUT解码,将8位ID转换为FP64
+//
+// ID压缩优势:
+//   - 数据压缩: 8位ID代替64位FP64,压缩比8:1
+//   - 减少HBM带宽需求
+//   - 适用于矩阵元素值有限的情况(如有限个非零值)
+//
+// 可选的ID/Meta解耦:
+//   - DECOUPLE_ID_META=1时,ID和元数据可独立流动,提高吞吐量
+// ============================================================================
+
 module b8c_decoder_id52 #(
     parameter AXI_WIDTH         = 512,
     parameter PARALLELISM       = 8,
@@ -312,6 +338,7 @@ module b8c_decoder_id52 #(
     wire stats_consume = DECOUPLE_ID_META ? consume_step_dec : consume_step_lock;
     wire stats_done = stats_active && !stats_reported && o_pipeline_idle && !s_axis_tvalid;
 
+`ifndef SYNTHESIS
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             stats_active <= 1'b0;
@@ -344,5 +371,24 @@ module b8c_decoder_id52 #(
             end
         end
     end
+`else
+    wire unused_stats_signals;
+    assign unused_stats_signals = &{1'b0, stats_start, stats_id_empty, stats_meta_empty,
+                                    stats_id_full, stats_meta_full, stats_pair_wait,
+                                    stats_consume, stats_done};
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            stats_active <= 1'b0;
+            stats_reported <= 1'b0;
+            id_empty_cycles <= 32'd0;
+            id_full_cycles <= 32'd0;
+            meta_empty_cycles <= 32'd0;
+            meta_full_cycles <= 32'd0;
+            pair_wait_cycles <= 32'd0;
+            consume_cycles <= 32'd0;
+        end
+    end
+`endif
 
 endmodule
