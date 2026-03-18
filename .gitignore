@@ -1,0 +1,17 @@
+# Ignore everything
+*
+
+# But not the source directory
+!.gitignore
+!frame_work.srcs/
+!frame_work.srcs/**
+!README.md
+!spmv_perf_model.py
+!FP64_MULTIPLIER_IEEE_PIPELINE_PLAN.md
+!DDR4_ADAPTER_INTERFACE_PLAN.md
+!docs/
+!docs/FP64_MULTIPLIER_IEEE_PIPELINE_PLAN.md
+!docs/DDR4_ADAPTER_INTERFACE_PLAN.md
+
+# Optional: Un-ignore the project file if needed later (commented out for now as per strict request)
+# !frame_work.xpr
