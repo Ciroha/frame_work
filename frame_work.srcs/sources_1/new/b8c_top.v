@@ -82,7 +82,9 @@ module b8c_top #(
     // ========================================================================
     // 派生参数计算
     // ========================================================================
-    localparam integer COMPUTE_DRAIN_CYCLES = 4;  // 计算流水线排空周期数
+    localparam integer FP64_MUL_LATENCY = 8;      // FP64乘法IP固定延迟
+    localparam integer META_OUT_STAGE = FP64_MUL_LATENCY + 1; // 元数据对齐到乘法输出
+    localparam integer COMPUTE_DRAIN_CYCLES = FP64_MUL_LATENCY + 3;  // 计算流水线排空周期数
     localparam integer IO_LANES = AXI_WIDTH / DATA_WIDTH;  // 每拍传输的数据个数(8)
     localparam integer LANE_RATIO = PARALLELISM / IO_LANES; // 并行度与IO比例(1或2)
     localparam integer X_AXI_BEATS = VECTOR_DEPTH * LANE_RATIO; // X向量传输拍数
@@ -134,61 +136,59 @@ module b8c_top #(
     wire                              dec_fifo_empty; // 解码器FIFO空标志
 
     // ========================================================================
-    // 流水线寄存器 (D1/D2/D3级)
-    // 用于对齐解码数据、X读数据、乘法结果到累加器
-    // ========================================================================
-    reg                               decoder_val_d1;
-    reg [PARALLELISM*DATA_WIDTH-1:0]  dec_vals_d1;
-    reg [PARALLELISM*16-1:0]          dec_row_deltas_d1;
-    reg [15:0]                        dec_row_base_d1;
-    reg [15:0]                        dec_col_base_d1;
+    reg [PARALLELISM*DATA_WIDTH-1:0] dec_vals_d1;
+    reg [PARALLELISM*DATA_WIDTH-1:0] dec_vals_d2;
+    reg                               compute_valid_d1;
+    reg                               compute_valid_d2;
+    reg [PARALLELISM*16-1:0]          dec_row_deltas_pipe [0:META_OUT_STAGE];
+    reg [15:0]                        dec_row_base_pipe [0:META_OUT_STAGE];
+    reg [15:0]                        dec_col_base_pipe [0:META_OUT_STAGE];
+    wire                              acc_ready;
+    wire                              acc_idle;
+    integer                           pipe_idx;
 
-    reg                               decoder_val_d2;
-    reg [PARALLELISM*16-1:0]          dec_row_deltas_d2;
-    reg [15:0]                        dec_row_base_d2;
-    reg [15:0]                        dec_col_base_d2;
-
-    reg                               decoder_val_d3;
-    reg [PARALLELISM*16-1:0]          dec_row_deltas_d3;
-    reg [15:0]                        dec_row_base_d3;
-    reg [15:0]                        dec_col_base_d3;
-
-    // ========================================================================
-    // 流水线寄存器更新逻辑
-    // 3级流水线对齐: 解码 -> X读取 -> 乘法 -> 累加
-    // ========================================================================
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            decoder_val_d1    <= 1'b0;
-            dec_vals_d1       <= {PARALLELISM*DATA_WIDTH{1'b0}};
-            dec_row_deltas_d1 <= {PARALLELISM*16{1'b0}};
-            dec_row_base_d1   <= 16'd0;
-            dec_col_base_d1   <= 16'd0;
-            decoder_val_d2    <= 1'b0;
-            dec_row_deltas_d2 <= {PARALLELISM*16{1'b0}};
-            dec_row_base_d2   <= 16'd0;
-            dec_col_base_d2   <= 16'd0;
-            decoder_val_d3    <= 1'b0;
-            dec_row_deltas_d3 <= {PARALLELISM*16{1'b0}};
-            dec_row_base_d3   <= 16'd0;
-            dec_col_base_d3   <= 16'd0;
+            dec_vals_d1 <= {PARALLELISM*DATA_WIDTH{1'b0}};
+            dec_vals_d2 <= {PARALLELISM*DATA_WIDTH{1'b0}};
+            compute_valid_d1 <= 1'b0;
+            compute_valid_d2 <= 1'b0;
+            for (pipe_idx = 0; pipe_idx <= META_OUT_STAGE; pipe_idx = pipe_idx + 1) begin
+                dec_row_deltas_pipe[pipe_idx] <= {PARALLELISM*16{1'b0}};
+                dec_row_base_pipe[pipe_idx]   <= 16'd0;
+                dec_col_base_pipe[pipe_idx]   <= 16'd0;
+            end
+        end else if (state == S_COMPUTE) begin
+            dec_vals_d1 <= decoder_val ? dec_vals : {PARALLELISM*DATA_WIDTH{1'b0}};
+            dec_vals_d2 <= dec_vals_d1;
+            compute_valid_d1 <= decoder_val;
+            compute_valid_d2 <= compute_valid_d1;
+
+            if (decoder_val) begin
+                dec_row_deltas_pipe[0] <= dec_row_deltas;
+                dec_row_base_pipe[0]   <= dec_row_base;
+                dec_col_base_pipe[0]   <= dec_col_base;
+            end else begin
+                dec_row_deltas_pipe[0] <= {PARALLELISM*16{1'b0}};
+                dec_row_base_pipe[0]   <= 16'd0;
+                dec_col_base_pipe[0]   <= 16'd0;
+            end
+
+            for (pipe_idx = 1; pipe_idx <= META_OUT_STAGE; pipe_idx = pipe_idx + 1) begin
+                dec_row_deltas_pipe[pipe_idx] <= dec_row_deltas_pipe[pipe_idx-1];
+                dec_row_base_pipe[pipe_idx]   <= dec_row_base_pipe[pipe_idx-1];
+                dec_col_base_pipe[pipe_idx]   <= dec_col_base_pipe[pipe_idx-1];
+            end
         end else begin
-            // D1级: 锁存解码器输出
-            decoder_val_d1    <= decoder_val;
-            dec_vals_d1       <= dec_vals;
-            dec_row_deltas_d1 <= dec_row_deltas;
-            dec_row_base_d1   <= dec_row_base;
-            dec_col_base_d1   <= dec_col_base;
-            // D2级: 等待X存储器读取
-            decoder_val_d2    <= decoder_val_d1;
-            dec_row_deltas_d2 <= dec_row_deltas_d1;
-            dec_row_base_d2   <= dec_row_base_d1;
-            dec_col_base_d2   <= dec_col_base_d1;
-            // D3级: 等待乘法完成
-            decoder_val_d3    <= decoder_val_d2;
-            dec_row_deltas_d3 <= dec_row_deltas_d2;
-            dec_row_base_d3   <= dec_row_base_d2;
-            dec_col_base_d3   <= dec_col_base_d2;
+            dec_vals_d1 <= {PARALLELISM*DATA_WIDTH{1'b0}};
+            dec_vals_d2 <= {PARALLELISM*DATA_WIDTH{1'b0}};
+            compute_valid_d1 <= 1'b0;
+            compute_valid_d2 <= 1'b0;
+            for (pipe_idx = 0; pipe_idx <= META_OUT_STAGE; pipe_idx = pipe_idx + 1) begin
+                dec_row_deltas_pipe[pipe_idx] <= {PARALLELISM*16{1'b0}};
+                dec_row_base_pipe[pipe_idx]   <= 16'd0;
+                dec_col_base_pipe[pipe_idx]   <= 16'd0;
+            end
         end
     end
 
@@ -271,15 +271,12 @@ module b8c_top #(
                         next_tlast_seen = 1'b1;  // 检测到最后一个数据
                     end
                 end else begin
-                    // 等待流水线排空
-                    if (!dec_fifo_empty) begin
-                        next_drain_cnt = COMPUTE_DRAIN_CYCLES;
-                    end else if (drain_cnt == 0) begin
+                    if (dec_fifo_empty && acc_idle) begin
                         next_state = S_STORE_Y;  // 排空完成,转入输出
                         next_load_cnt = 0;
                         next_tlast_seen = 1'b0;
                     end else begin
-                        next_drain_cnt = drain_cnt - 1'b1;
+                        next_drain_cnt = COMPUTE_DRAIN_CYCLES;
                     end
                 end
             end
@@ -326,8 +323,8 @@ module b8c_top #(
     // ========================================================================
     wire axis_to_dec_valid = (state == S_COMPUTE) && s_axis_tvalid; // 计算阶段才允许解码
     wire dec_ready_out;
-    wire compute_in_ready = 1'b1;  // 假设计算单元始终就绪
-    wire compute_req_next = (state == S_COMPUTE) && compute_in_ready; // 请求下一拍数据
+    wire compute_req_next = (state == S_COMPUTE); // 固定吞吐请求下一拍数据
+    wire compute_fire = decoder_val;
 
     // s_axis_tready 生成: 根据状态决定是否接收数据
     reg s_axis_tready_comb;
@@ -404,7 +401,7 @@ module b8c_top #(
     generate
         for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_x_addr
             // 主路径: 列基址 + 通道偏移, 右移得到bank地址
-            assign x_rd_addr_mapped[i*ADDR_WIDTH +: ADDR_WIDTH] = (dec_col_base_d1 + i) >> COL_SHIFT;
+            assign x_rd_addr_mapped[i*ADDR_WIDTH +: ADDR_WIDTH] = (dec_col_base_pipe[0] + i) >> COL_SHIFT;
         end
     endgenerate
 
@@ -414,8 +411,8 @@ module b8c_top #(
     // ========================================================================
     generate
         for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_x_sym_addr
-            wire [15:0] sym_delta = dec_row_deltas_d1[i*16 +: 16];
-            wire [15:0] sym_row_abs = dec_row_base_d1 + sym_delta;
+            wire [15:0] sym_delta = dec_row_deltas_pipe[0][i*16 +: 16];
+            wire [15:0] sym_row_abs = dec_row_base_pipe[0] + sym_delta;
             // 对称路径使用全局地址索引
             assign x_sym_rd_addr_global[i*X_GLOBAL_AW +: X_GLOBAL_AW] = sym_row_abs[X_GLOBAL_AW-1:0];
         end
@@ -475,10 +472,12 @@ module b8c_top #(
     // 执行 matrix_value * x_value 的FP64乘法
     // ========================================================================
     compute_pipeline #(
-        .PARALLELISM(PARALLELISM)
+        .PARALLELISM(PARALLELISM),
+        .MUL_LATENCY(FP64_MUL_LATENCY)
     ) u_compute (
         .clk(clk),
-        .matrix_values(dec_vals_d1),         // 矩阵元素值
+        .in_valid(compute_valid_d2),
+        .matrix_values(dec_vals_d2),         // 矩阵元素值，与 X 读数据对齐
         .x_values_main(x_rd_data),           // X向量值(主路径)
         .x_values_sym(x_sym_rd_data),        // X向量值(对称路径)
         .routed_products_main(pp_data_main), // 乘积结果(主路径)
@@ -509,15 +508,15 @@ module b8c_top #(
     wire [PARALLELISM-1:0]            y_sym_diag_mask;     // 对角线掩码(对角线元素不重复计算)
     generate
         for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_y_addr
-            wire [15:0] delta_d3 = dec_row_deltas_d3[i*16 +: 16];
-            wire [15:0] row_abs_d3 = dec_row_base_d3 + delta_d3;  // 绝对行地址
-            wire [15:0] col_abs_d3 = dec_col_base_d3 + i;         // 绝对列地址
+            wire [15:0] delta_d = dec_row_deltas_pipe[META_OUT_STAGE][i*16 +: 16];
+            wire [15:0] row_abs_d = dec_row_base_pipe[META_OUT_STAGE] + delta_d;  // 绝对行地址
+            wire [15:0] col_abs_d = dec_col_base_pipe[META_OUT_STAGE] + i;         // 绝对列地址
             // 主路径: 按行累加 Y[row] += A[row,col] * X[col]
-            assign y_compute_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = row_abs_d3[ADDR_WIDTH-1:0];
+            assign y_compute_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = row_abs_d[ADDR_WIDTH-1:0];
             // 对称路径: 按列累加 Y[col] += A[row,col] * X[row] (利用对称性)
-            assign y_compute_addr_sym[i*ADDR_WIDTH +: ADDR_WIDTH] = col_abs_d3[ADDR_WIDTH-1:0];
+            assign y_compute_addr_sym[i*ADDR_WIDTH +: ADDR_WIDTH] = col_abs_d[ADDR_WIDTH-1:0];
             // 对角线检测: 行列相等时跳过对称路径
-            assign y_sym_diag_mask[i] = (row_abs_d3 == col_abs_d3);
+            assign y_sym_diag_mask[i] = (row_abs_d == col_abs_d);
         end
     endgenerate
 
@@ -632,13 +631,16 @@ module b8c_top #(
         .ls_addr(y_ls_addr),
         .load_data(y_load_data_w),
         .store_data(y_store_data),
+        .acc_ready(acc_ready),
+        .acc_idle(acc_idle),
+        .batch_fire(compute_fire),
         // 主路径累加: Y[row] += A[row,col] * X[col]
         .partial_products_a(pp_data_main),
-        .pp_valid_a(pp_valid_main & {PARALLELISM{decoder_val_d3}}),
+        .pp_valid_a(pp_valid_main),
         .y_local_addr_a(y_compute_addr),
         // 对称路径累加: Y[col] += A[row,col] * X[row]
         .partial_products_b(pp_data_sym),
-        .pp_valid_b(pp_valid_sym & {PARALLELISM{decoder_val_d3 & SYMMETRIC_UPPER_ONLY}} & ~y_sym_diag_mask),
+        .pp_valid_b(pp_valid_sym & {PARALLELISM{SYMMETRIC_UPPER_ONLY}} & ~y_sym_diag_mask),
         .y_local_addr_b(y_compute_addr_sym)
     );
 
