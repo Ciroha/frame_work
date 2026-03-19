@@ -5,8 +5,10 @@
 !.gitignore
 !frame_work.srcs/
 !frame_work.srcs/**
+!frame_work.xpr
 !README.md
 !spmv_perf_model.py
+!run_impl_direct.tcl
 !FP64_MULTIPLIER_IEEE_PIPELINE_PLAN.md
 !DDR4_ADAPTER_INTERFACE_PLAN.md
 !docs/
