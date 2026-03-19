@@ -27,12 +27,12 @@ module tb_b8c_top_ram();
     localparam ACTIVE_COMPUTE_BEATS = MODE_ID52 ? COMPUTE_ID_BEATS : COMPUTE_BEATS;
     localparam COMPUTE_STREAM_MEM_BEATS = (COMPUTE_BEATS > COMPUTE_ID_BEATS) ? COMPUTE_BEATS : COMPUTE_ID_BEATS;
 
-    parameter string X_STREAM_FILE       = "../../../../frame_work.srcs/sim_1/data/hpcg_16-1_l16/x_stream.hex";
-    parameter string Y_STREAM_FILE       = "../../../../frame_work.srcs/sim_1/data/hpcg_16-1_l16/y_stream.hex";
-    parameter string COMPUTE_STREAM_FILE = "../../../../frame_work.srcs/sim_1/data/hpcg_16-1_l16/compute_stream.hex";
-    parameter string COMPUTE_ID_STREAM_FILE = "../../../../frame_work.srcs/sim_1/data/hpcg_16-1_l16/compute_id_stream.hex";
-    parameter string LUT_FILE            = "../../../../frame_work.srcs/sim_1/data/hpcg_16-1_l16/lut.hex";
-    parameter string GOLDEN_Y_FILE       = "../../../../frame_work.srcs/sim_1/data/hpcg_16-1_l16/golden_y.hex";
+    parameter string X_STREAM_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/x_stream.hex";
+    parameter string Y_STREAM_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/y_stream.hex";
+    parameter string COMPUTE_STREAM_FILE = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/compute_stream.hex";
+    parameter string COMPUTE_ID_STREAM_FILE = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/compute_id_stream.hex";
+    parameter string LUT_FILE            = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/lut.hex";
+    parameter string GOLDEN_Y_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/golden_y.hex";
 
     localparam [63:0] FP64_1_0 = 64'h3FF0_0000_0000_0000;
     localparam [63:0] FP64_2_0 = 64'h4000_0000_0000_0000;
@@ -121,6 +121,18 @@ module tb_b8c_top_ram();
                    MAT_DATA_BEATS, META_EMIT_BEATS);
         end
 
+        require_file(X_STREAM_FILE);
+        require_file(Y_STREAM_FILE);
+        if (MODE_ID52) begin
+            require_file(COMPUTE_ID_STREAM_FILE);
+            require_file(LUT_FILE);
+        end else begin
+            require_file(COMPUTE_STREAM_FILE);
+        end
+        if (GOLDEN_Y_FILE != "") begin
+            require_file(GOLDEN_Y_FILE);
+        end
+
         $readmemh(X_STREAM_FILE, x_stream_mem);
         $readmemh(Y_STREAM_FILE, y_stream_mem);
         if (MODE_ID52) begin
@@ -183,6 +195,10 @@ module tb_b8c_top_ram();
                 for (int lane = 0; lane < IO_LANES; lane++) begin
                     logic [63:0] act;
                     act = m_axis_tdata[lane*64 +: 64];
+                    if ($isunknown(act)) begin
+                        $error("Y contains X/Z at scalar %0d: got=%h", scalar_idx, act);
+                        error_count++;
+                    end
                     if (enable_data_check && (scalar_idx < Y_ELEMS)) begin
                         if (act !== golden_y_bits[scalar_idx]) begin
                             $error("Y mismatch at scalar %0d: exp=%h got=%h",
@@ -274,6 +290,18 @@ module tb_b8c_top_ram();
 
             s_axis_tvalid <= 0;
             s_axis_tlast <= 0;
+        end
+    endtask
+
+    task require_file;
+        input string path;
+        integer fd;
+        begin
+            fd = $fopen(path, "r");
+            if (fd == 0) begin
+                $fatal(1, "Required file missing or unreadable: %s", path);
+            end
+            $fclose(fd);
         end
     endtask
 
