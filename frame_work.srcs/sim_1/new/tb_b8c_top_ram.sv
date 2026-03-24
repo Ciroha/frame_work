@@ -3,15 +3,17 @@
 module tb_b8c_top_ram();
 
     parameter AXI_WIDTH    = 512;
-    parameter PARALLELISM  = 16;
+    parameter PARALLELISM  = 8;
     parameter MODE_ID52    = 1'b1;
     parameter SYMMETRIC_UPPER_ONLY = 1'b0;
+    parameter SIM_USE_MUL_IP = 1'b1;
+    parameter SIM_USE_ADD_IP = 1'b1;
     parameter DECOUPLE_ID_META = 1'b0;
     parameter ID_Q_DEPTH   = 8;
     parameter META_Q_DEPTH = 8;
-    parameter VECTOR_DEPTH = 256;
+    parameter VECTOR_DEPTH = 512;
     parameter Y_ELEMS      = 4096;
-    parameter MAT_DATA_BEATS = 6352;
+    parameter MAT_DATA_BEATS = 12704;
     localparam IO_LANES       = AXI_WIDTH / 64;
     localparam LANE_RATIO     = PARALLELISM / IO_LANES;
     localparam MAX_ADDR_ELEMS = (VECTOR_DEPTH > Y_ELEMS) ? VECTOR_DEPTH : Y_ELEMS;
@@ -27,12 +29,12 @@ module tb_b8c_top_ram();
     localparam ACTIVE_COMPUTE_BEATS = MODE_ID52 ? COMPUTE_ID_BEATS : COMPUTE_BEATS;
     localparam COMPUTE_STREAM_MEM_BEATS = (COMPUTE_BEATS > COMPUTE_ID_BEATS) ? COMPUTE_BEATS : COMPUTE_ID_BEATS;
 
-    parameter string X_STREAM_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/x_stream.hex";
-    parameter string Y_STREAM_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/y_stream.hex";
-    parameter string COMPUTE_STREAM_FILE = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/compute_stream.hex";
-    parameter string COMPUTE_ID_STREAM_FILE = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/compute_id_stream.hex";
-    parameter string LUT_FILE            = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/lut.hex";
-    parameter string GOLDEN_Y_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/golden_y.hex";
+    parameter string X_STREAM_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1/x_stream.hex";
+    parameter string Y_STREAM_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1/y_stream.hex";
+    parameter string COMPUTE_STREAM_FILE = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1/compute_stream.hex";
+    parameter string COMPUTE_ID_STREAM_FILE = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1/compute_id_stream.hex";
+    parameter string LUT_FILE            = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1/lut.hex";
+    parameter string GOLDEN_Y_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1/golden_y.hex";
 
     localparam [63:0] FP64_1_0 = 64'h3FF0_0000_0000_0000;
     localparam [63:0] FP64_2_0 = 64'h4000_0000_0000_0000;
@@ -65,6 +67,8 @@ module tb_b8c_top_ram();
         .PARALLELISM(PARALLELISM),
         .MODE_ID52(MODE_ID52),
         .SYMMETRIC_UPPER_ONLY(SYMMETRIC_UPPER_ONLY),
+        .SIM_USE_MUL_IP(SIM_USE_MUL_IP),
+        .SIM_USE_ADD_IP(SIM_USE_ADD_IP),
         .LUT_INIT_FILE(LUT_FILE),
         .DECOUPLE_ID_META(DECOUPLE_ID_META),
         .ID_Q_DEPTH(ID_Q_DEPTH),

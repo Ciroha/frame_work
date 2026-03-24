@@ -44,6 +44,8 @@ module b8c_top #(
     parameter DECOUPLE_ID_META = 1'b0,   // ID/Meta解耦使能(提高吞吐量)
     parameter ID_Q_DEPTH = 8,            // ID队列深度
     parameter META_Q_DEPTH = 8,          // Meta队列深度
+    parameter SIM_USE_MUL_IP = 1'b1,     // 仿真时乘法: 1=IP, 0=行为模型
+    parameter SIM_USE_ADD_IP = 1'b1,     // 仿真时加法: 1=IP, 0=行为模型
     parameter VECTOR_DEPTH = 4096,       // X向量存储深度
     parameter Y_ELEMS      = 23,         // Y向量元素个数
     parameter ADDR_WIDTH   = ((((VECTOR_DEPTH > Y_ELEMS) ? VECTOR_DEPTH : Y_ELEMS) <= 1) ?
@@ -145,7 +147,14 @@ module b8c_top #(
     reg [15:0]                        dec_col_base_pipe [0:META_OUT_STAGE];
     wire                              acc_ready;
     wire                              acc_idle;
+    wire                              dec_ready_out;
+    wire                              compute_req_next;
+    wire                              compute_fire;
+    reg  [FP64_MUL_LATENCY-1:0]       compute_inflight_pipe;
+    wire                              compute_mul_busy;
     integer                           pipe_idx;
+
+    assign compute_mul_busy = |compute_inflight_pipe;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
@@ -153,18 +162,24 @@ module b8c_top #(
             dec_vals_d2 <= {PARALLELISM*DATA_WIDTH{1'b0}};
             compute_valid_d1 <= 1'b0;
             compute_valid_d2 <= 1'b0;
+            compute_inflight_pipe <= {FP64_MUL_LATENCY{1'b0}};
             for (pipe_idx = 0; pipe_idx <= META_OUT_STAGE; pipe_idx = pipe_idx + 1) begin
                 dec_row_deltas_pipe[pipe_idx] <= {PARALLELISM*16{1'b0}};
                 dec_row_base_pipe[pipe_idx]   <= 16'd0;
                 dec_col_base_pipe[pipe_idx]   <= 16'd0;
             end
         end else if (state == S_COMPUTE) begin
-            dec_vals_d1 <= decoder_val ? dec_vals : {PARALLELISM*DATA_WIDTH{1'b0}};
+            compute_inflight_pipe[0] <= compute_fire;
+            for (pipe_idx = 1; pipe_idx < FP64_MUL_LATENCY; pipe_idx = pipe_idx + 1) begin
+                compute_inflight_pipe[pipe_idx] <= compute_inflight_pipe[pipe_idx-1];
+            end
+
+            dec_vals_d1 <= compute_fire ? dec_vals : {PARALLELISM*DATA_WIDTH{1'b0}};
             dec_vals_d2 <= dec_vals_d1;
-            compute_valid_d1 <= decoder_val;
+            compute_valid_d1 <= compute_fire;
             compute_valid_d2 <= compute_valid_d1;
 
-            if (decoder_val) begin
+            if (compute_fire) begin
                 dec_row_deltas_pipe[0] <= dec_row_deltas;
                 dec_row_base_pipe[0]   <= dec_row_base;
                 dec_col_base_pipe[0]   <= dec_col_base;
@@ -184,6 +199,7 @@ module b8c_top #(
             dec_vals_d2 <= {PARALLELISM*DATA_WIDTH{1'b0}};
             compute_valid_d1 <= 1'b0;
             compute_valid_d2 <= 1'b0;
+            compute_inflight_pipe <= {FP64_MUL_LATENCY{1'b0}};
             for (pipe_idx = 0; pipe_idx <= META_OUT_STAGE; pipe_idx = pipe_idx + 1) begin
                 dec_row_deltas_pipe[pipe_idx] <= {PARALLELISM*16{1'b0}};
                 dec_row_base_pipe[pipe_idx]   <= 16'd0;
@@ -322,9 +338,10 @@ module b8c_top #(
     // 解码器接口信号
     // ========================================================================
     wire axis_to_dec_valid = (state == S_COMPUTE) && s_axis_tvalid; // 计算阶段才允许解码
-    wire dec_ready_out;
-    wire compute_req_next = (state == S_COMPUTE); // 固定吞吐请求下一拍数据
-    wire compute_fire = decoder_val;
+    // Correctness-first gating: only release a new compute batch when both
+    // the multiplier pipeline and the accumulator are fully drained.
+    assign compute_req_next = (state == S_COMPUTE) && acc_idle && !compute_mul_busy;
+    assign compute_fire = decoder_val && compute_req_next;
 
     // s_axis_tready 生成: 根据状态决定是否接收数据
     reg s_axis_tready_comb;
@@ -473,7 +490,8 @@ module b8c_top #(
     // ========================================================================
     compute_pipeline #(
         .PARALLELISM(PARALLELISM),
-        .MUL_LATENCY(FP64_MUL_LATENCY)
+        .MUL_LATENCY(FP64_MUL_LATENCY),
+        .SIM_USE_IP(SIM_USE_MUL_IP)
     ) u_compute (
         .clk(clk),
         .in_valid(compute_valid_d2),
@@ -623,7 +641,8 @@ module b8c_top #(
         .PARALLELISM(PARALLELISM),
         .DEPTH(Y_ELEMS),
         .DATA_WIDTH(DATA_WIDTH),
-        .ADDR_WIDTH(ADDR_WIDTH)
+        .ADDR_WIDTH(ADDR_WIDTH),
+        .SIM_USE_IP(SIM_USE_ADD_IP)
     ) u_y_acc (
         .clk(clk),
         .mode(y_mode),

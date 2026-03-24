@@ -4,7 +4,8 @@ module y_acc_banks #(
     parameter PARALLELISM = 8,
     parameter DATA_WIDTH  = 64,
     parameter DEPTH       = 128,
-    parameter ADDR_WIDTH  = $clog2(DEPTH)
+    parameter ADDR_WIDTH  = $clog2(DEPTH),
+    parameter SIM_USE_IP  = 1'b1
 )(
     input  wire clk,
     input  wire [1:0] mode,
@@ -58,6 +59,250 @@ module y_acc_banks #(
     assign enqueue_fire = |pp_valid_all;
     assign unused_batch_fire = batch_fire;
 
+`ifndef SYNTHESIS
+    generate
+        if (!SIM_USE_IP) begin : gen_acc_behavior
+            integer sim_idx;
+            integer lane_idx;
+            real y_real_mem [0:DEPTH-1];
+            real acc_value_real;
+
+            assign acc_ready = 1'b1;
+            assign acc_idle = 1'b1;
+
+            initial begin
+                for (sim_idx = 0; sim_idx < DEPTH; sim_idx = sim_idx + 1) begin
+                    y_real_mem[sim_idx] = 0.0;
+                end
+            end
+
+            always @(posedge clk) begin
+                if (mode == 2'b01) begin
+                    if (ls_en) begin
+                        for (lane_idx = 0; lane_idx < PARALLELISM; lane_idx = lane_idx + 1) begin
+                            if (((ls_addr * PARALLELISM) + lane_idx) < DEPTH) begin
+                                y_real_mem[(ls_addr * PARALLELISM) + lane_idx] =
+                                    $bitstoreal(load_data[lane_idx*DATA_WIDTH +: DATA_WIDTH]);
+                            end
+                        end
+                    end
+                end else if (mode == 2'b10) begin
+                    for (lane_idx = 0; lane_idx < UPDATE_CHANNELS; lane_idx = lane_idx + 1) begin
+                        if (pp_valid_all[lane_idx] && (addr[lane_idx] < DEPTH)) begin
+                            acc_value_real = y_real_mem[addr[lane_idx]] +
+                                             $bitstoreal(pp[lane_idx]);
+                            y_real_mem[addr[lane_idx]] = acc_value_real;
+                        end
+                    end
+                end else if (mode == 2'b11) begin
+                    if (ls_en) begin
+                        for (lane_idx = 0; lane_idx < PARALLELISM; lane_idx = lane_idx + 1) begin
+                            if (((ls_addr * PARALLELISM) + lane_idx) < DEPTH) begin
+                                r_store_data[lane_idx*DATA_WIDTH +: DATA_WIDTH] <=
+                                    $realtobits(y_real_mem[(ls_addr * PARALLELISM) + lane_idx]);
+                            end else begin
+                                r_store_data[lane_idx*DATA_WIDTH +: DATA_WIDTH] <=
+                                    {DATA_WIDTH{1'b0}};
+                            end
+                        end
+                    end
+                end
+            end
+        end else begin : gen_acc_ip_sim
+            wire [PARALLELISM-1:0] acc_ready_vec;
+            wire [PARALLELISM-1:0] acc_idle_vec;
+            assign acc_ready = &acc_ready_vec;
+            assign acc_idle = &acc_idle_vec;
+
+            genvar bank_idx;
+            for (bank_idx = 0; bank_idx < PARALLELISM; bank_idx = bank_idx + 1) begin : gen_y_bank
+                (* ram_style = "distributed" *) reg [DATA_WIDTH-1:0] bank_ram [0:BANK_DEPTH-1];
+                reg bank_valid_pipe [0:ADD_LATENCY-1];
+                reg [BANK_ADDR_WIDTH-1:0] bank_addr_pipe [0:ADD_LATENCY-1];
+                reg [QUEUE_COUNT_WIDTH-1:0] bank_q_count;
+                reg [QUEUE_PTR_WIDTH-1:0] bank_q_head;
+                reg [QUEUE_PTR_WIDTH-1:0] bank_q_tail;
+                reg bank_q_valid [0:QUEUE_DEPTH-1];
+                reg [BANK_ADDR_WIDTH-1:0] bank_q_addr [0:QUEUE_DEPTH-1];
+                reg [DATA_WIDTH-1:0] bank_q_data [0:QUEUE_DEPTH-1];
+
+                integer init_idx;
+                integer pipe_idx;
+                integer hit_idx;
+                integer enqueue_idx;
+                integer bank_hit_count;
+                integer queue_space;
+
+                reg bank_issue_fire;
+                reg bank_head_conflict;
+                reg [BANK_ADDR_WIDTH-1:0] bank_issue_addr;
+                reg [DATA_WIDTH-1:0] bank_issue_data;
+                reg bank_ready;
+                reg bank_idle;
+                reg [QUEUE_PTR_WIDTH-1:0] q_head_next;
+                reg [QUEUE_PTR_WIDTH-1:0] q_tail_next;
+                reg [QUEUE_COUNT_WIDTH-1:0] q_count_next;
+                reg [QUEUE_PTR_WIDTH-1:0] enq_ptr;
+
+                wire [ADDR_WIDTH:0] abs_idx = (ls_addr * PARALLELISM) + bank_idx;
+                wire bank_in_range = (abs_idx < DEPTH);
+                wire [BANK_ADDR_WIDTH-1:0] bank_ls_addr = ls_addr[BANK_ADDR_WIDTH-1:0];
+                wire [DATA_WIDTH-1:0] bank_old_data;
+                wire [DATA_WIDTH-1:0] bank_new_data;
+                wire [4:0] bank_status;
+                wire bank_result_valid;
+                wire unused_status;
+
+                assign acc_ready_vec[bank_idx] = bank_ready;
+                assign acc_idle_vec[bank_idx] = bank_idle;
+
+                always @(*) begin
+                    bank_hit_count = 0;
+                    for (hit_idx = 0; hit_idx < UPDATE_CHANNELS; hit_idx = hit_idx + 1) begin
+                        if (pp_valid_all[hit_idx] &&
+                            (addr[hit_idx] < DEPTH) &&
+                            (bank_sel[hit_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
+                            bank_hit_count = bank_hit_count + 1;
+                        end
+                    end
+
+                    queue_space = QUEUE_DEPTH - bank_q_count;
+                    bank_ready = (queue_space >= bank_hit_count);
+                    bank_idle = (bank_q_count == 0);
+                    for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
+                        if (bank_valid_pipe[pipe_idx]) begin
+                            bank_idle = 1'b0;
+                        end
+                    end
+
+                    bank_issue_fire = 1'b0;
+                    bank_head_conflict = 1'b0;
+                    bank_issue_addr = bank_q_addr[bank_q_head];
+                    bank_issue_data = bank_q_data[bank_q_head];
+
+                    if ((mode == 2'b10) && (bank_q_count != 0) && bank_q_valid[bank_q_head]) begin
+                        for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
+                            if (bank_valid_pipe[pipe_idx] && (bank_addr_pipe[pipe_idx] == bank_q_addr[bank_q_head])) begin
+                                bank_head_conflict = 1'b1;
+                            end
+                        end
+                        bank_issue_fire = !bank_head_conflict;
+                    end
+                end
+
+                assign bank_old_data = bank_ram[bank_issue_addr];
+                assign unused_status = &{1'b0, bank_status};
+
+                fp64_add_xilinx_wrapper #(
+                    .LATENCY(ADD_LATENCY)
+                ) u_bank_add (
+                    .clk(clk),
+                    .s_valid(bank_issue_fire),
+                    .s_ready(),
+                    .s_a_bits(bank_old_data),
+                    .s_b_bits(bank_issue_data),
+                    .m_valid(bank_result_valid),
+                    .m_ready(1'b1),
+                    .m_result_bits(bank_new_data),
+                    .m_status(bank_status)
+                );
+
+                initial begin
+                    for (init_idx = 0; init_idx < ADD_LATENCY; init_idx = init_idx + 1) begin
+                        bank_valid_pipe[init_idx] = 1'b0;
+                        bank_addr_pipe[init_idx] = {BANK_ADDR_WIDTH{1'b0}};
+                    end
+                    bank_q_count = {QUEUE_COUNT_WIDTH{1'b0}};
+                    bank_q_head = {QUEUE_PTR_WIDTH{1'b0}};
+                    bank_q_tail = {QUEUE_PTR_WIDTH{1'b0}};
+                    for (init_idx = 0; init_idx < QUEUE_DEPTH; init_idx = init_idx + 1) begin
+                        bank_q_valid[init_idx] = 1'b0;
+                        bank_q_addr[init_idx] = {BANK_ADDR_WIDTH{1'b0}};
+                        bank_q_data[init_idx] = {DATA_WIDTH{1'b0}};
+                    end
+                end
+
+                always @(posedge clk) begin
+                    if ((mode == 2'b01) && ls_en && bank_in_range && (ls_addr < BANK_DEPTH)) begin
+                        bank_ram[bank_ls_addr] <= load_data[bank_idx*DATA_WIDTH +: DATA_WIDTH];
+                    end
+
+                    if ((mode == 2'b11) && ls_en) begin
+                        if (bank_in_range && (ls_addr < BANK_DEPTH)) begin
+                            r_store_data[bank_idx*DATA_WIDTH +: DATA_WIDTH] <= bank_ram[bank_ls_addr];
+                        end else begin
+                            r_store_data[bank_idx*DATA_WIDTH +: DATA_WIDTH] <= {DATA_WIDTH{1'b0}};
+                        end
+                    end
+
+                    if (mode != 2'b10) begin
+                        bank_q_count <= {QUEUE_COUNT_WIDTH{1'b0}};
+                        bank_q_head <= {QUEUE_PTR_WIDTH{1'b0}};
+                        bank_q_tail <= {QUEUE_PTR_WIDTH{1'b0}};
+                        for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
+                            bank_valid_pipe[pipe_idx] <= 1'b0;
+                            bank_addr_pipe[pipe_idx] <= {BANK_ADDR_WIDTH{1'b0}};
+                        end
+                        for (pipe_idx = 0; pipe_idx < QUEUE_DEPTH; pipe_idx = pipe_idx + 1) begin
+                            bank_q_valid[pipe_idx] <= 1'b0;
+                            bank_q_addr[pipe_idx] <= {BANK_ADDR_WIDTH{1'b0}};
+                            bank_q_data[pipe_idx] <= {DATA_WIDTH{1'b0}};
+                        end
+                    end else begin
+                        q_head_next = bank_q_head;
+                        q_tail_next = bank_q_tail;
+                        q_count_next = bank_q_count;
+
+                        if (enqueue_fire && acc_ready_vec[bank_idx]) begin
+                            enq_ptr = bank_q_tail;
+                            for (enqueue_idx = 0; enqueue_idx < UPDATE_CHANNELS; enqueue_idx = enqueue_idx + 1) begin
+                                if (pp_valid_all[enqueue_idx] &&
+                                    (addr[enqueue_idx] < DEPTH) &&
+                                    (bank_sel[enqueue_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
+                                    bank_q_valid[enq_ptr] <= 1'b1;
+                                    bank_q_addr[enq_ptr] <= bank_addr[enqueue_idx];
+                                    bank_q_data[enq_ptr] <= pp[enqueue_idx];
+                                    if (enq_ptr == QUEUE_DEPTH-1) begin
+                                        enq_ptr = {QUEUE_PTR_WIDTH{1'b0}};
+                                    end else begin
+                                        enq_ptr = enq_ptr + 1'b1;
+                                    end
+                                    q_count_next = q_count_next + 1'b1;
+                                end
+                            end
+                            q_tail_next = enq_ptr;
+                        end
+
+                        for (pipe_idx = ADD_LATENCY-1; pipe_idx > 0; pipe_idx = pipe_idx - 1) begin
+                            bank_valid_pipe[pipe_idx] <= bank_valid_pipe[pipe_idx-1];
+                            bank_addr_pipe[pipe_idx] <= bank_addr_pipe[pipe_idx-1];
+                        end
+                        bank_valid_pipe[0] <= bank_issue_fire;
+                        bank_addr_pipe[0] <= bank_issue_fire ? bank_issue_addr : {BANK_ADDR_WIDTH{1'b0}};
+
+                        if (bank_issue_fire) begin
+                            bank_q_valid[bank_q_head] <= 1'b0;
+                            if (q_head_next == QUEUE_DEPTH-1) begin
+                                q_head_next = {QUEUE_PTR_WIDTH{1'b0}};
+                            end else begin
+                                q_head_next = q_head_next + 1'b1;
+                            end
+                            q_count_next = q_count_next - 1'b1;
+                        end
+
+                        bank_q_head <= q_head_next;
+                        bank_q_tail <= q_tail_next;
+                        bank_q_count <= q_count_next;
+
+                        if (bank_result_valid) begin
+                            bank_ram[bank_addr_pipe[ADD_LATENCY-1]] <= bank_new_data;
+                        end
+                    end
+                end
+            end
+        end
+    endgenerate
+`else
     wire [PARALLELISM-1:0] acc_ready_vec;
     wire [PARALLELISM-1:0] acc_idle_vec;
     assign acc_ready = &acc_ready_vec;
@@ -251,5 +496,6 @@ module y_acc_banks #(
             end
         end
     endgenerate
+`endif
 
 endmodule

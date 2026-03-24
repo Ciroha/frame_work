@@ -172,8 +172,6 @@ module b8c_decoder_id52 #(
     // Lockstep decode path (DECOUPLE_ID_META = 0)
     // ------------------------------------------------------------------------
     wire [PARALLELISM*DATA_WIDTH-1:0] fp_vec_lock;
-    reg  [PARALLELISM*DATA_WIDTH-1:0] fp_vec_lock_d1;
-
     value_lut_decode #(
         .PARALLELISM(PARALLELISM),
         .ID_WIDTH(ID_WIDTH),
@@ -183,14 +181,6 @@ module b8c_decoder_id52 #(
         .id_vec(id_vec),
         .fp_vec(fp_vec_lock)
     );
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            fp_vec_lock_d1 <= {PARALLELISM*DATA_WIDTH{1'b0}};
-        end else if (consume_step_lock) begin
-            fp_vec_lock_d1 <= fp_vec_lock;
-        end
-    end
 
     wire pipeline_idle_lock = id_empty && meta_empty && !id_valid && !meta_valid;
 
@@ -278,8 +268,6 @@ module b8c_decoder_id52 #(
         meta_q_empty ? {META_VEC_W{1'b0}} : meta_queue[meta_q_rptr];
 
     wire [PARALLELISM*DATA_WIDTH-1:0] fp_vec_dec;
-    reg  [PARALLELISM*DATA_WIDTH-1:0] fp_vec_dec_d1;
-
     value_lut_decode #(
         .PARALLELISM(PARALLELISM),
         .ID_WIDTH(ID_WIDTH),
@@ -289,14 +277,6 @@ module b8c_decoder_id52 #(
         .id_vec(id_head_dec),
         .fp_vec(fp_vec_dec)
     );
-
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            fp_vec_dec_d1 <= {PARALLELISM*DATA_WIDTH{1'b0}};
-        end else if (consume_step_dec) begin
-            fp_vec_dec_d1 <= fp_vec_dec;
-        end
-    end
 
     wire [15:0] dec_row_base_dec = meta_head_dec[15:0];
     wire [15:0] dec_col_base_dec = meta_head_dec[31:16];
@@ -311,7 +291,7 @@ module b8c_decoder_id52 #(
     // Outputs
     // ------------------------------------------------------------------------
     assign decoder_valid = DECOUPLE_ID_META ? decoder_valid_dec : decoder_valid_lock;
-    assign m_vals_data = DECOUPLE_ID_META ? fp_vec_dec_d1 : fp_vec_lock_d1;
+    assign m_vals_data = DECOUPLE_ID_META ? fp_vec_dec : fp_vec_lock;
     assign m_row_deltas = DECOUPLE_ID_META ? dec_row_deltas_dec : parser_row_delta;
     assign m_row_base = DECOUPLE_ID_META ? dec_row_base_dec : parser_row_base;
     assign m_col_base = DECOUPLE_ID_META ? dec_col_base_dec : parser_col_base;
