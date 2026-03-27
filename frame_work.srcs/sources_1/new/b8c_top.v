@@ -87,6 +87,7 @@ module b8c_top #(
     localparam integer FP64_MUL_LATENCY = 8;      // FP64乘法IP固定延迟
     localparam integer META_OUT_STAGE = FP64_MUL_LATENCY + 1; // 元数据对齐到乘法输出
     localparam integer COMPUTE_DRAIN_CYCLES = FP64_MUL_LATENCY + 3;  // 计算流水线排空周期数
+    localparam CONTINUOUS_ISSUE_MODE = MODE_ID52 && (PARALLELISM == 8) && !SYMMETRIC_UPPER_ONLY;
     localparam integer IO_LANES = AXI_WIDTH / DATA_WIDTH;  // 每拍传输的数据个数(8)
     localparam integer LANE_RATIO = PARALLELISM / IO_LANES; // 并行度与IO比例(1或2)
     localparam integer X_AXI_BEATS = VECTOR_DEPTH * LANE_RATIO; // X向量传输拍数
@@ -287,7 +288,7 @@ module b8c_top #(
                         next_tlast_seen = 1'b1;  // 检测到最后一个数据
                     end
                 end else begin
-                    if (dec_fifo_empty && acc_idle) begin
+                    if (dec_fifo_empty && acc_idle && !compute_mul_busy) begin
                         next_state = S_STORE_Y;  // 排空完成,转入输出
                         next_load_cnt = 0;
                         next_tlast_seen = 1'b0;
@@ -338,9 +339,11 @@ module b8c_top #(
     // 解码器接口信号
     // ========================================================================
     wire axis_to_dec_valid = (state == S_COMPUTE) && s_axis_tvalid; // 计算阶段才允许解码
-    // Correctness-first gating: only release a new compute batch when both
-    // the multiplier pipeline and the accumulator are fully drained.
-    assign compute_req_next = (state == S_COMPUTE) && acc_idle && !compute_mul_busy;
+    // Continuous-issue mode is enabled only for the validated non-symmetric
+    // LUT-ID path. Other modes keep the conservative drain-based gating.
+    assign compute_req_next = CONTINUOUS_ISSUE_MODE ?
+                              ((state == S_COMPUTE) && acc_ready) :
+                              ((state == S_COMPUTE) && acc_idle && !compute_mul_busy);
     assign compute_fire = decoder_val && compute_req_next;
 
     // s_axis_tready 生成: 根据状态决定是否接收数据
@@ -491,7 +494,8 @@ module b8c_top #(
     compute_pipeline #(
         .PARALLELISM(PARALLELISM),
         .MUL_LATENCY(FP64_MUL_LATENCY),
-        .SIM_USE_IP(SIM_USE_MUL_IP)
+        .SIM_USE_IP(SIM_USE_MUL_IP),
+        .ENABLE_SYM_PATH(SYMMETRIC_UPPER_ONLY)
     ) u_compute (
         .clk(clk),
         .in_valid(compute_valid_d2),
@@ -523,12 +527,19 @@ module b8c_top #(
     // ========================================================================
     wire [PARALLELISM*ADDR_WIDTH-1:0] y_compute_addr;      // 主路径Y地址
     wire [PARALLELISM*ADDR_WIDTH-1:0] y_compute_addr_sym;  // 对称路径Y地址
+    wire [PARALLELISM*ADDR_WIDTH-1:0] y_preview_addr;      // 当前batch预览Y地址
+    wire [PARALLELISM*ADDR_WIDTH-1:0] y_preview_addr_sym;  // 当前batch预览对称Y地址
     wire [PARALLELISM-1:0]            y_sym_diag_mask;     // 对角线掩码(对角线元素不重复计算)
     generate
         for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_y_addr
+            wire [15:0] delta_p = dec_row_deltas[i*16 +: 16];
+            wire [15:0] row_abs_p = dec_row_base + delta_p;
+            wire [15:0] col_abs_p = dec_col_base + i;
             wire [15:0] delta_d = dec_row_deltas_pipe[META_OUT_STAGE][i*16 +: 16];
             wire [15:0] row_abs_d = dec_row_base_pipe[META_OUT_STAGE] + delta_d;  // 绝对行地址
             wire [15:0] col_abs_d = dec_col_base_pipe[META_OUT_STAGE] + i;         // 绝对列地址
+            assign y_preview_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = row_abs_p[ADDR_WIDTH-1:0];
+            assign y_preview_addr_sym[i*ADDR_WIDTH +: ADDR_WIDTH] = col_abs_p[ADDR_WIDTH-1:0];
             // 主路径: 按行累加 Y[row] += A[row,col] * X[col]
             assign y_compute_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = row_abs_d[ADDR_WIDTH-1:0];
             // 对称路径: 按列累加 Y[col] += A[row,col] * X[row] (利用对称性)
@@ -642,7 +653,8 @@ module b8c_top #(
         .DEPTH(Y_ELEMS),
         .DATA_WIDTH(DATA_WIDTH),
         .ADDR_WIDTH(ADDR_WIDTH),
-        .SIM_USE_IP(SIM_USE_ADD_IP)
+        .SIM_USE_IP(SIM_USE_ADD_IP),
+        .ENABLE_PREVIEW_RESERVE(CONTINUOUS_ISSUE_MODE)
     ) u_y_acc (
         .clk(clk),
         .mode(y_mode),
@@ -653,6 +665,10 @@ module b8c_top #(
         .acc_ready(acc_ready),
         .acc_idle(acc_idle),
         .batch_fire(compute_fire),
+        .preview_valid_a({PARALLELISM{CONTINUOUS_ISSUE_MODE && decoder_val}}),
+        .preview_y_local_addr_a(y_preview_addr),
+        .preview_valid_b({PARALLELISM{1'b0}}),
+        .preview_y_local_addr_b({PARALLELISM*ADDR_WIDTH{1'b0}}),
         // 主路径累加: Y[row] += A[row,col] * X[col]
         .partial_products_a(pp_data_main),
         .pp_valid_a(pp_valid_main),
