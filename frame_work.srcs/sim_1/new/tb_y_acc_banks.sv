@@ -1,6 +1,9 @@
 `timescale 1ns / 1ps
 
-module tb_y_acc_banks;
+module tb_y_acc_banks #(
+    parameter SIM_USE_MUL_IP = 1'b1,
+    parameter SIM_USE_ADD_IP = 1'b1
+)();
 
     localparam PARALLELISM = 8;
     localparam DATA_WIDTH  = 64;
@@ -29,12 +32,16 @@ module tb_y_acc_banks;
     reg [PARALLELISM*ADDR_WIDTH-1:0] y_local_addr_b;
 
     integer errors;
+    wire unused_sim_params;
+
+    assign unused_sim_params = &{1'b0, SIM_USE_MUL_IP, SIM_USE_ADD_IP};
 
     y_acc_banks #(
         .PARALLELISM(PARALLELISM),
         .DATA_WIDTH(DATA_WIDTH),
         .DEPTH(DEPTH),
-        .ADDR_WIDTH(ADDR_WIDTH)
+        .ADDR_WIDTH(ADDR_WIDTH),
+        .QUEUE_DEPTH(2)
     ) dut (
         .clk(clk),
         .mode(mode),
@@ -82,6 +89,8 @@ module tb_y_acc_banks;
         case_same_bank_same_addr;
         clear_memory;
         case_same_bank_diff_addr;
+        clear_memory;
+        case_bank_credit_boundary;
 
         if (errors == 0) begin
             $display("tb_y_acc_banks PASSED");
@@ -230,6 +239,44 @@ module tb_y_acc_banks;
             read_store_beat(5'd1, beat1);
             expect_word(beat0[ 63:  0], FP64_ONE, "diff addr beat0 lane0");
             expect_word(beat1[ 63:  0], FP64_TWO, "diff addr beat1 lane0");
+        end
+    endtask
+
+    task case_bank_credit_boundary;
+        reg [PARALLELISM*DATA_WIDTH-1:0] beat0;
+        reg [PARALLELISM*DATA_WIDTH-1:0] beat1;
+        reg [PARALLELISM*DATA_WIDTH-1:0] beat2;
+        begin
+            $display("CASE bank credit boundary");
+            mode = 2'b10;
+            partial_products_a = {FP64_ZERO, FP64_ZERO, FP64_ZERO, FP64_ZERO, FP64_ZERO, FP64_ONE, FP64_ONE, FP64_ONE};
+            pp_valid_a = 8'b0000_0111;
+            y_local_addr_a = {5'd0, 5'd0, 5'd0, 5'd0, 5'd0, 5'd16, 5'd8, 5'd0};
+            partial_products_b = {PARALLELISM*DATA_WIDTH{1'b0}};
+            pp_valid_b = {PARALLELISM{1'b0}};
+            y_local_addr_b = {PARALLELISM*ADDR_WIDTH{1'b0}};
+            batch_fire = 1'b1;
+
+            #1;
+            if (acc_ready !== 1'b0) begin
+                $error("bank credit boundary acc_ready exp=0 got=%b", acc_ready);
+                errors = errors + 1;
+            end
+
+            @(posedge clk);
+            partial_products_a = {PARALLELISM*DATA_WIDTH{1'b0}};
+            pp_valid_a = {PARALLELISM{1'b0}};
+            y_local_addr_a = {PARALLELISM*ADDR_WIDTH{1'b0}};
+            batch_fire = 1'b0;
+            mode = 2'b00;
+            @(posedge clk);
+
+            read_store_beat(5'd0, beat0);
+            read_store_beat(5'd1, beat1);
+            read_store_beat(5'd2, beat2);
+            expect_word(beat0[ 63:  0], FP64_ZERO, "credit boundary beat0 lane0");
+            expect_word(beat1[ 63:  0], FP64_ZERO, "credit boundary beat1 lane0");
+            expect_word(beat2[ 63:  0], FP64_ZERO, "credit boundary beat2 lane0");
         end
     endtask
 

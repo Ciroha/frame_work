@@ -6,7 +6,10 @@ module y_acc_banks #(
     parameter DEPTH       = 128,
     parameter ADDR_WIDTH  = $clog2(DEPTH),
     parameter SIM_USE_IP  = 1'b1,
-    parameter ENABLE_PREVIEW_RESERVE = 1'b1
+    parameter ENABLE_PREVIEW_RESERVE = 1'b1,
+    parameter QUEUE_DEPTH = 256,
+    parameter SIM_ENABLE_BANK_STATS = 1'b0,
+    parameter SIM_PRINT_BATCH_BANK_STATS = 1'b0
 )(
     input  wire clk,
     input  wire [1:0] mode,
@@ -34,7 +37,6 @@ module y_acc_banks #(
     localparam integer BANK_SEL_WIDTH = (PARALLELISM <= 1) ? 1 : $clog2(PARALLELISM);
     localparam integer BANK_ADDR_WIDTH = (BANK_DEPTH <= 1) ? 1 : $clog2(BANK_DEPTH);
     localparam integer ADD_LATENCY = 8;
-    localparam integer QUEUE_DEPTH = 256;
     localparam integer QUEUE_PTR_WIDTH = $clog2(QUEUE_DEPTH);
     localparam integer QUEUE_COUNT_WIDTH = $clog2(QUEUE_DEPTH + 1);
 
@@ -71,6 +73,215 @@ module y_acc_banks #(
     assign unused_batch_fire = batch_fire;
 
 `ifndef SYNTHESIS
+    reg                              merged_enqueue_fire;
+    reg                              merged_preview_valid [0:UPDATE_CHANNELS-1];
+    reg                              merged_pp_valid [0:UPDATE_CHANNELS-1];
+    reg [ADDR_WIDTH-1:0]             merged_preview_addr [0:UPDATE_CHANNELS-1];
+    reg [ADDR_WIDTH-1:0]             merged_pp_addr [0:UPDATE_CHANNELS-1];
+    reg [BANK_SEL_WIDTH-1:0]         merged_preview_bank [0:UPDATE_CHANNELS-1];
+    reg [BANK_SEL_WIDTH-1:0]         merged_pp_bank [0:UPDATE_CHANNELS-1];
+    reg [BANK_ADDR_WIDTH-1:0]        merged_pp_bank_addr [0:UPDATE_CHANNELS-1];
+    reg [DATA_WIDTH-1:0]             merged_pp_data [0:UPDATE_CHANNELS-1];
+    reg [QUEUE_COUNT_WIDTH-1:0]      merged_preview_bank_hit_count [0:PARALLELISM-1];
+    reg [QUEUE_COUNT_WIDTH-1:0]      merged_pp_bank_hit_count [0:PARALLELISM-1];
+    reg [QUEUE_COUNT_WIDTH-1:0]      raw_preview_bank_hit_count [0:PARALLELISM-1];
+    reg [QUEUE_COUNT_WIDTH-1:0]      raw_pp_bank_hit_count [0:PARALLELISM-1];
+    real                             merged_pp_sum_real [0:UPDATE_CHANNELS-1];
+    integer                          merge_bank_idx;
+    integer                          merge_idx;
+    integer                          merge_insert_idx;
+    integer                          merge_preview_idx;
+    integer                          merge_pp_idx;
+    integer                          merge_preview_match;
+    integer                          merge_pp_match;
+    integer                          stat_idx;
+    integer                          stat_max_raw;
+    integer                          stat_max_merged;
+    integer                          stat_batch_seq;
+    integer                          stat_preview_batches;
+    integer                          stat_accepted_batches;
+    integer                          stat_rejected_batches;
+    integer                          stat_raw_total [0:PARALLELISM-1];
+    integer                          stat_merged_total [0:PARALLELISM-1];
+    integer                          stat_raw_max [0:PARALLELISM-1];
+    integer                          stat_merged_max [0:PARALLELISM-1];
+    integer                          stat_raw_hot_count [0:PARALLELISM-1];
+    integer                          stat_merged_hot_count [0:PARALLELISM-1];
+    reg                              stat_dumped;
+
+    always @(*) begin
+        merged_enqueue_fire = 1'b0;
+        for (merge_idx = 0; merge_idx < UPDATE_CHANNELS; merge_idx = merge_idx + 1) begin
+            merged_preview_valid[merge_idx] = 1'b0;
+            merged_pp_valid[merge_idx] = 1'b0;
+            merged_preview_addr[merge_idx] = {ADDR_WIDTH{1'b0}};
+            merged_pp_addr[merge_idx] = {ADDR_WIDTH{1'b0}};
+            merged_preview_bank[merge_idx] = {BANK_SEL_WIDTH{1'b0}};
+            merged_pp_bank[merge_idx] = {BANK_SEL_WIDTH{1'b0}};
+            merged_pp_bank_addr[merge_idx] = {BANK_ADDR_WIDTH{1'b0}};
+            merged_pp_data[merge_idx] = {DATA_WIDTH{1'b0}};
+            merged_pp_sum_real[merge_idx] = 0.0;
+        end
+
+        for (merge_bank_idx = 0; merge_bank_idx < PARALLELISM; merge_bank_idx = merge_bank_idx + 1) begin
+            merged_preview_bank_hit_count[merge_bank_idx] = {QUEUE_COUNT_WIDTH{1'b0}};
+            merged_pp_bank_hit_count[merge_bank_idx] = {QUEUE_COUNT_WIDTH{1'b0}};
+            raw_preview_bank_hit_count[merge_bank_idx] = {QUEUE_COUNT_WIDTH{1'b0}};
+            raw_pp_bank_hit_count[merge_bank_idx] = {QUEUE_COUNT_WIDTH{1'b0}};
+        end
+
+        merge_preview_idx = 0;
+        for (merge_idx = 0; merge_idx < UPDATE_CHANNELS; merge_idx = merge_idx + 1) begin
+            if (preview_valid_all[merge_idx] && (preview_addr[merge_idx] < DEPTH)) begin
+                raw_preview_bank_hit_count[preview_bank_sel[merge_idx]] =
+                    raw_preview_bank_hit_count[preview_bank_sel[merge_idx]] + 1'b1;
+                merge_preview_match = -1;
+                for (merge_insert_idx = 0; merge_insert_idx < merge_preview_idx; merge_insert_idx = merge_insert_idx + 1) begin
+                    if (merged_preview_valid[merge_insert_idx] &&
+                        (merged_preview_addr[merge_insert_idx] == preview_addr[merge_idx])) begin
+                        merge_preview_match = merge_insert_idx;
+                    end
+                end
+
+                if (merge_preview_match < 0) begin
+                    merged_preview_valid[merge_preview_idx] = 1'b1;
+                    merged_preview_addr[merge_preview_idx] = preview_addr[merge_idx];
+                    merged_preview_bank[merge_preview_idx] = preview_bank_sel[merge_idx];
+                    merged_preview_bank_hit_count[preview_bank_sel[merge_idx]] =
+                        merged_preview_bank_hit_count[preview_bank_sel[merge_idx]] + 1'b1;
+                    merge_preview_idx = merge_preview_idx + 1;
+                end
+            end
+        end
+
+        merge_pp_idx = 0;
+        for (merge_idx = 0; merge_idx < UPDATE_CHANNELS; merge_idx = merge_idx + 1) begin
+            if (pp_valid_all[merge_idx] && (addr[merge_idx] < DEPTH)) begin
+                merged_enqueue_fire = 1'b1;
+                raw_pp_bank_hit_count[bank_sel[merge_idx]] =
+                    raw_pp_bank_hit_count[bank_sel[merge_idx]] + 1'b1;
+                merge_pp_match = -1;
+                for (merge_insert_idx = 0; merge_insert_idx < merge_pp_idx; merge_insert_idx = merge_insert_idx + 1) begin
+                    if (merged_pp_valid[merge_insert_idx] &&
+                        (merged_pp_addr[merge_insert_idx] == addr[merge_idx])) begin
+                        merge_pp_match = merge_insert_idx;
+                    end
+                end
+
+                if (merge_pp_match < 0) begin
+                    merged_pp_valid[merge_pp_idx] = 1'b1;
+                    merged_pp_addr[merge_pp_idx] = addr[merge_idx];
+                    merged_pp_bank[merge_pp_idx] = bank_sel[merge_idx];
+                    merged_pp_bank_addr[merge_pp_idx] = bank_addr[merge_idx];
+                    merged_pp_data[merge_pp_idx] = pp[merge_idx];
+                    merged_pp_sum_real[merge_pp_idx] = $bitstoreal(pp[merge_idx]);
+                    merged_pp_bank_hit_count[bank_sel[merge_idx]] =
+                        merged_pp_bank_hit_count[bank_sel[merge_idx]] + 1'b1;
+                    merge_pp_idx = merge_pp_idx + 1;
+                end else begin
+                    merged_pp_sum_real[merge_pp_match] =
+                        merged_pp_sum_real[merge_pp_match] + $bitstoreal(pp[merge_idx]);
+                    merged_pp_data[merge_pp_match] =
+                        $realtobits(merged_pp_sum_real[merge_pp_match]);
+                end
+            end
+        end
+    end
+
+    initial begin
+        stat_batch_seq = 0;
+        stat_preview_batches = 0;
+        stat_accepted_batches = 0;
+        stat_rejected_batches = 0;
+        stat_dumped = 1'b0;
+        for (stat_idx = 0; stat_idx < PARALLELISM; stat_idx = stat_idx + 1) begin
+            stat_raw_total[stat_idx] = 0;
+            stat_merged_total[stat_idx] = 0;
+            stat_raw_max[stat_idx] = 0;
+            stat_merged_max[stat_idx] = 0;
+            stat_raw_hot_count[stat_idx] = 0;
+            stat_merged_hot_count[stat_idx] = 0;
+        end
+    end
+
+    always @(posedge clk) begin
+        if (SIM_ENABLE_BANK_STATS) begin
+            if (mode != 2'b10) begin
+                if (mode == 2'b11) begin
+                    if (ls_en && !stat_dumped) begin
+                        $display("BANK_STATS batches preview=%0d accepted=%0d rejected=%0d",
+                                 stat_preview_batches, stat_accepted_batches, stat_rejected_batches);
+                        for (stat_idx = 0; stat_idx < PARALLELISM; stat_idx = stat_idx + 1) begin
+                            $display("BANK_STATS bank=%0d raw_total=%0d merged_total=%0d raw_max=%0d merged_max=%0d raw_hot=%0d merged_hot=%0d",
+                                     stat_idx,
+                                     stat_raw_total[stat_idx],
+                                     stat_merged_total[stat_idx],
+                                     stat_raw_max[stat_idx],
+                                     stat_merged_max[stat_idx],
+                                     stat_raw_hot_count[stat_idx],
+                                     stat_merged_hot_count[stat_idx]);
+                        end
+                        stat_dumped <= 1'b1;
+                    end
+                end else begin
+                    stat_dumped <= 1'b0;
+                end
+            end
+
+            if ((mode == 2'b10) && (|preview_valid_all)) begin
+                stat_batch_seq <= stat_batch_seq + 1;
+                stat_preview_batches <= stat_preview_batches + 1;
+                if (batch_fire && acc_ready) begin
+                    stat_accepted_batches <= stat_accepted_batches + 1;
+                end else if (!batch_fire) begin
+                    stat_rejected_batches <= stat_rejected_batches + 1;
+                end
+
+                stat_max_raw = 0;
+                stat_max_merged = 0;
+                for (stat_idx = 0; stat_idx < PARALLELISM; stat_idx = stat_idx + 1) begin
+                    if (raw_preview_bank_hit_count[stat_idx] > stat_max_raw) begin
+                        stat_max_raw = raw_preview_bank_hit_count[stat_idx];
+                    end
+                    if (merged_preview_bank_hit_count[stat_idx] > stat_max_merged) begin
+                        stat_max_merged = merged_preview_bank_hit_count[stat_idx];
+                    end
+                end
+
+                for (stat_idx = 0; stat_idx < PARALLELISM; stat_idx = stat_idx + 1) begin
+                    stat_raw_total[stat_idx] <= stat_raw_total[stat_idx] + raw_preview_bank_hit_count[stat_idx];
+                    stat_merged_total[stat_idx] <= stat_merged_total[stat_idx] + merged_preview_bank_hit_count[stat_idx];
+                    if (raw_preview_bank_hit_count[stat_idx] > stat_raw_max[stat_idx]) begin
+                        stat_raw_max[stat_idx] <= raw_preview_bank_hit_count[stat_idx];
+                    end
+                    if (merged_preview_bank_hit_count[stat_idx] > stat_merged_max[stat_idx]) begin
+                        stat_merged_max[stat_idx] <= merged_preview_bank_hit_count[stat_idx];
+                    end
+                    if ((stat_max_raw != 0) && (raw_preview_bank_hit_count[stat_idx] == stat_max_raw)) begin
+                        stat_raw_hot_count[stat_idx] <= stat_raw_hot_count[stat_idx] + 1;
+                    end
+                    if ((stat_max_merged != 0) && (merged_preview_bank_hit_count[stat_idx] == stat_max_merged)) begin
+                        stat_merged_hot_count[stat_idx] <= stat_merged_hot_count[stat_idx] + 1;
+                    end
+                end
+
+                if (SIM_PRINT_BATCH_BANK_STATS) begin
+                    $display("BANK_BATCH idx=%0d raw=%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d merged=%0d,%0d,%0d,%0d,%0d,%0d,%0d,%0d accepted=%0d",
+                             stat_batch_seq,
+                             raw_preview_bank_hit_count[0], raw_preview_bank_hit_count[1],
+                             raw_preview_bank_hit_count[2], raw_preview_bank_hit_count[3],
+                             raw_preview_bank_hit_count[4], raw_preview_bank_hit_count[5],
+                             raw_preview_bank_hit_count[6], raw_preview_bank_hit_count[7],
+                             merged_preview_bank_hit_count[0], merged_preview_bank_hit_count[1],
+                             merged_preview_bank_hit_count[2], merged_preview_bank_hit_count[3],
+                             merged_preview_bank_hit_count[4], merged_preview_bank_hit_count[5],
+                             merged_preview_bank_hit_count[6], merged_preview_bank_hit_count[7],
+                             batch_fire && acc_ready);
+                end
+            end
+        end
+    end
+
     generate
         if (!SIM_USE_IP) begin : gen_acc_behavior
             integer sim_idx;
@@ -101,10 +312,10 @@ module y_acc_banks #(
                     end
                 end else if (mode == 2'b10) begin
                     for (lane_idx = 0; lane_idx < UPDATE_CHANNELS; lane_idx = lane_idx + 1) begin
-                        if (pp_valid_all[lane_idx] && (addr[lane_idx] < DEPTH)) begin
-                            acc_value_real = y_real_mem[addr[lane_idx]] +
-                                             $bitstoreal(pp[lane_idx]);
-                            y_real_mem[addr[lane_idx]] = acc_value_real;
+                        if (merged_pp_valid[lane_idx] && (merged_pp_addr[lane_idx] < DEPTH)) begin
+                            acc_value_real = y_real_mem[merged_pp_addr[lane_idx]] +
+                                             $bitstoreal(merged_pp_data[lane_idx]);
+                            y_real_mem[merged_pp_addr[lane_idx]] = acc_value_real;
                         end
                     end
                 end else if (mode == 2'b11) begin
@@ -143,7 +354,6 @@ module y_acc_banks #(
                 integer init_idx;
                 integer pipe_idx;
                 integer hit_idx;
-                integer preview_hit_idx;
                 integer enqueue_idx;
                 integer bank_hit_count;
                 integer preview_bank_hit_count;
@@ -174,23 +384,8 @@ module y_acc_banks #(
                 assign acc_idle_vec[bank_idx] = bank_idle;
 
                 always @(*) begin
-                    bank_hit_count = 0;
-                    for (hit_idx = 0; hit_idx < UPDATE_CHANNELS; hit_idx = hit_idx + 1) begin
-                        if (pp_valid_all[hit_idx] &&
-                            (addr[hit_idx] < DEPTH) &&
-                            (bank_sel[hit_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
-                            bank_hit_count = bank_hit_count + 1;
-                        end
-                    end
-
-                    preview_bank_hit_count = 0;
-                    for (preview_hit_idx = 0; preview_hit_idx < UPDATE_CHANNELS; preview_hit_idx = preview_hit_idx + 1) begin
-                        if (preview_valid_all[preview_hit_idx] &&
-                            (preview_addr[preview_hit_idx] < DEPTH) &&
-                            (preview_bank_sel[preview_hit_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
-                            preview_bank_hit_count = preview_bank_hit_count + 1;
-                        end
-                    end
+                    bank_hit_count = merged_pp_bank_hit_count[bank_idx];
+                    preview_bank_hit_count = merged_preview_bank_hit_count[bank_idx];
 
                     if (ENABLE_PREVIEW_RESERVE) begin
                         queue_space = QUEUE_DEPTH - bank_q_count - bank_reserved_count;
@@ -292,15 +487,14 @@ module y_acc_banks #(
                             q_reserved_next = q_reserved_next + preview_bank_hit_count[QUEUE_COUNT_WIDTH-1:0];
                         end
 
-                        if (enqueue_fire && (!ENABLE_PREVIEW_RESERVE ? acc_ready_vec[bank_idx] : 1'b1)) begin
+                        if (merged_enqueue_fire && (!ENABLE_PREVIEW_RESERVE ? acc_ready_vec[bank_idx] : 1'b1)) begin
                             enq_ptr = bank_q_tail;
                             for (enqueue_idx = 0; enqueue_idx < UPDATE_CHANNELS; enqueue_idx = enqueue_idx + 1) begin
-                                if (pp_valid_all[enqueue_idx] &&
-                                    (addr[enqueue_idx] < DEPTH) &&
-                                    (bank_sel[enqueue_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
+                                if (merged_pp_valid[enqueue_idx] &&
+                                    (merged_pp_bank[enqueue_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
                                     bank_q_valid[enq_ptr] <= 1'b1;
-                                    bank_q_addr[enq_ptr] <= bank_addr[enqueue_idx];
-                                    bank_q_data[enq_ptr] <= pp[enqueue_idx];
+                                    bank_q_addr[enq_ptr] <= merged_pp_bank_addr[enqueue_idx];
+                                    bank_q_data[enq_ptr] <= merged_pp_data[enqueue_idx];
                                     if (enq_ptr == QUEUE_DEPTH-1) begin
                                         enq_ptr = {QUEUE_PTR_WIDTH{1'b0}};
                                     end else begin
@@ -391,18 +585,18 @@ module y_acc_banks #(
             wire bank_result_valid;
             wire unused_status;
 
-            assign acc_ready_vec[bank_idx] = bank_ready;
-            assign acc_idle_vec[bank_idx] = bank_idle;
+                assign acc_ready_vec[bank_idx] = bank_ready;
+                assign acc_idle_vec[bank_idx] = bank_idle;
 
-            always @(*) begin
-                bank_hit_count = 0;
-                for (hit_idx = 0; hit_idx < UPDATE_CHANNELS; hit_idx = hit_idx + 1) begin
-                    if (pp_valid_all[hit_idx] &&
-                        (addr[hit_idx] < DEPTH) &&
-                        (bank_sel[hit_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
-                        bank_hit_count = bank_hit_count + 1;
+                always @(*) begin
+                    bank_hit_count = 0;
+                    for (hit_idx = 0; hit_idx < UPDATE_CHANNELS; hit_idx = hit_idx + 1) begin
+                        if (pp_valid_all[hit_idx] &&
+                            (addr[hit_idx] < DEPTH) &&
+                            (bank_sel[hit_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
+                            bank_hit_count = bank_hit_count + 1;
+                        end
                     end
-                end
 
                 queue_space = QUEUE_DEPTH - bank_q_count;
                 bank_ready = (queue_space >= bank_hit_count);
