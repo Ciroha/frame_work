@@ -61,7 +61,7 @@
     <Option Name="EnableBDX" Val="FALSE"/>
     <Option Name="DSABoardId" Val="v80"/>
     <Option Name="NextGenVersal" Val="TRUE"/>
-    <Option Name="WTXSimLaunchSim" Val="130"/>
+    <Option Name="WTXSimLaunchSim" Val="141"/>
     <Option Name="WTModelSimLaunchSim" Val="0"/>
     <Option Name="WTQuestaLaunchSim" Val="0"/>
     <Option Name="WTIesLaunchSim" Val="0"/>
@@ -312,8 +312,6 @@
         <Option Name="xsim.simulate.log_all_signals" Val="true"/>
         <Generic Name="SIM_USE_MUL_IP" Val="1"/>
         <Generic Name="SIM_USE_ADD_IP" Val="1"/>
-        <Generic Name="SIM_ENABLE_BANK_STATS" Val="1"/>
-        <Generic Name="SIM_PRINT_BATCH_BANK_STATS" Val="1"/>
       </Config>
     </FileSet>
     <FileSet Name="utils_1" Type="Utils" RelSrcDir="$PSRCDIR/utils_1" RelGenDir="$PGENDIR/utils_1">

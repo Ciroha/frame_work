@@ -9,7 +9,9 @@ module y_acc_banks #(
     parameter ENABLE_PREVIEW_RESERVE = 1'b1,
     parameter QUEUE_DEPTH = 256,
     parameter SIM_ENABLE_BANK_STATS = 1'b0,
-    parameter SIM_PRINT_BATCH_BANK_STATS = 1'b0
+    parameter SIM_PRINT_BATCH_BANK_STATS = 1'b0,
+    parameter SIM_ENABLE_STALL_REASON_STATS = 1'b0,
+    parameter ENABLE_LIMITED_BYPASS = 1'b0
 )(
     input  wire clk,
     input  wire [1:0] mode,
@@ -39,6 +41,7 @@ module y_acc_banks #(
     localparam integer ADD_LATENCY = 8;
     localparam integer QUEUE_PTR_WIDTH = $clog2(QUEUE_DEPTH);
     localparam integer QUEUE_COUNT_WIDTH = $clog2(QUEUE_DEPTH + 1);
+    localparam integer LIMITED_BYPASS_WINDOW = 4;
 
     reg [PARALLELISM*DATA_WIDTH-1:0] r_store_data;
     assign store_data = r_store_data;
@@ -107,7 +110,7 @@ module y_acc_banks #(
     integer                          stat_merged_max [0:PARALLELISM-1];
     integer                          stat_raw_hot_count [0:PARALLELISM-1];
     integer                          stat_merged_hot_count [0:PARALLELISM-1];
-    reg                              stat_dumped;
+    reg                              stat_bank_dumped;
 
     always @(*) begin
         merged_enqueue_fire = 1'b0;
@@ -193,7 +196,7 @@ module y_acc_banks #(
         stat_preview_batches = 0;
         stat_accepted_batches = 0;
         stat_rejected_batches = 0;
-        stat_dumped = 1'b0;
+        stat_bank_dumped = 1'b0;
         for (stat_idx = 0; stat_idx < PARALLELISM; stat_idx = stat_idx + 1) begin
             stat_raw_total[stat_idx] = 0;
             stat_merged_total[stat_idx] = 0;
@@ -208,7 +211,7 @@ module y_acc_banks #(
         if (SIM_ENABLE_BANK_STATS) begin
             if (mode != 2'b10) begin
                 if (mode == 2'b11) begin
-                    if (ls_en && !stat_dumped) begin
+                    if (ls_en && !stat_bank_dumped) begin
                         $display("BANK_STATS batches preview=%0d accepted=%0d rejected=%0d",
                                  stat_preview_batches, stat_accepted_batches, stat_rejected_batches);
                         for (stat_idx = 0; stat_idx < PARALLELISM; stat_idx = stat_idx + 1) begin
@@ -221,10 +224,10 @@ module y_acc_banks #(
                                      stat_raw_hot_count[stat_idx],
                                      stat_merged_hot_count[stat_idx]);
                         end
-                        stat_dumped <= 1'b1;
+                        stat_bank_dumped <= 1'b1;
                     end
                 end else begin
-                    stat_dumped <= 1'b0;
+                    stat_bank_dumped <= 1'b0;
                 end
             end
 
@@ -363,13 +366,25 @@ module y_acc_banks #(
                 reg bank_head_conflict;
                 reg [BANK_ADDR_WIDTH-1:0] bank_issue_addr;
                 reg [DATA_WIDTH-1:0] bank_issue_data;
+                reg [QUEUE_PTR_WIDTH-1:0] bank_issue_slot;
                 reg bank_ready;
                 reg bank_idle;
+                reg bank_window_has_candidate;
                 reg [QUEUE_PTR_WIDTH-1:0] q_head_next;
                 reg [QUEUE_PTR_WIDTH-1:0] q_tail_next;
                 reg [QUEUE_COUNT_WIDTH-1:0] q_count_next;
                 reg [QUEUE_COUNT_WIDTH-1:0] q_reserved_next;
                 reg [QUEUE_PTR_WIDTH-1:0] enq_ptr;
+                integer issue_sel_idx;
+                integer shift_idx;
+                integer issue_limit;
+                integer stat_ready_block_count;
+                integer stat_ready_block_deficit_sum;
+                integer stat_issue_fire_count;
+                integer stat_issue_head_pick_count;
+                integer stat_issue_bypass_pick_count;
+                integer stat_issue_conflict_block_count;
+                reg stat_stall_dumped_local;
 
                 wire [ADDR_WIDTH:0] abs_idx = (ls_addr * PARALLELISM) + bank_idx;
                 wire bank_in_range = (abs_idx < DEPTH);
@@ -404,16 +419,38 @@ module y_acc_banks #(
 
                     bank_issue_fire = 1'b0;
                     bank_head_conflict = 1'b0;
-                    bank_issue_addr = bank_q_addr[bank_q_head];
-                    bank_issue_data = bank_q_data[bank_q_head];
+                    bank_issue_slot = {QUEUE_PTR_WIDTH{1'b0}};
+                    bank_issue_addr = bank_q_addr[0];
+                    bank_issue_data = bank_q_data[0];
+                    bank_window_has_candidate = 1'b0;
 
-                    if ((mode == 2'b10) && (bank_q_count != 0) && bank_q_valid[bank_q_head]) begin
-                        for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
-                            if (bank_valid_pipe[pipe_idx] && (bank_addr_pipe[pipe_idx] == bank_q_addr[bank_q_head])) begin
-                                bank_head_conflict = 1'b1;
+                    if (mode == 2'b10) begin
+                        issue_limit = 0;
+                        if (bank_q_count != 0) begin
+                            if (ENABLE_LIMITED_BYPASS) begin
+                                issue_limit = (bank_q_count < LIMITED_BYPASS_WINDOW) ? bank_q_count : LIMITED_BYPASS_WINDOW;
+                            end else begin
+                                issue_limit = 1;
                             end
                         end
-                        bank_issue_fire = !bank_head_conflict;
+
+                        for (issue_sel_idx = 0; issue_sel_idx < issue_limit; issue_sel_idx = issue_sel_idx + 1) begin
+                            bank_head_conflict = 1'b0;
+                            if (bank_q_valid[issue_sel_idx]) begin
+                                bank_window_has_candidate = 1'b1;
+                                for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
+                                    if (bank_valid_pipe[pipe_idx] && (bank_addr_pipe[pipe_idx] == bank_q_addr[issue_sel_idx])) begin
+                                        bank_head_conflict = 1'b1;
+                                    end
+                                end
+                                if (!bank_issue_fire && !bank_head_conflict) begin
+                                    bank_issue_fire = 1'b1;
+                                    bank_issue_slot = issue_sel_idx[QUEUE_PTR_WIDTH-1:0];
+                                    bank_issue_addr = bank_q_addr[issue_sel_idx];
+                                    bank_issue_data = bank_q_data[issue_sel_idx];
+                                end
+                            end
+                        end
                     end
                 end
 
@@ -443,6 +480,13 @@ module y_acc_banks #(
                     bank_reserved_count = {QUEUE_COUNT_WIDTH{1'b0}};
                     bank_q_head = {QUEUE_PTR_WIDTH{1'b0}};
                     bank_q_tail = {QUEUE_PTR_WIDTH{1'b0}};
+                    stat_ready_block_count = 0;
+                    stat_ready_block_deficit_sum = 0;
+                    stat_issue_fire_count = 0;
+                    stat_issue_head_pick_count = 0;
+                    stat_issue_bypass_pick_count = 0;
+                    stat_issue_conflict_block_count = 0;
+                    stat_stall_dumped_local = 1'b0;
                     for (init_idx = 0; init_idx < QUEUE_DEPTH; init_idx = init_idx + 1) begin
                         bank_q_valid[init_idx] = 1'b0;
                         bank_q_addr[init_idx] = {BANK_ADDR_WIDTH{1'b0}};
@@ -487,28 +531,6 @@ module y_acc_banks #(
                             q_reserved_next = q_reserved_next + preview_bank_hit_count[QUEUE_COUNT_WIDTH-1:0];
                         end
 
-                        if (merged_enqueue_fire && (!ENABLE_PREVIEW_RESERVE ? acc_ready_vec[bank_idx] : 1'b1)) begin
-                            enq_ptr = bank_q_tail;
-                            for (enqueue_idx = 0; enqueue_idx < UPDATE_CHANNELS; enqueue_idx = enqueue_idx + 1) begin
-                                if (merged_pp_valid[enqueue_idx] &&
-                                    (merged_pp_bank[enqueue_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
-                                    bank_q_valid[enq_ptr] <= 1'b1;
-                                    bank_q_addr[enq_ptr] <= merged_pp_bank_addr[enqueue_idx];
-                                    bank_q_data[enq_ptr] <= merged_pp_data[enqueue_idx];
-                                    if (enq_ptr == QUEUE_DEPTH-1) begin
-                                        enq_ptr = {QUEUE_PTR_WIDTH{1'b0}};
-                                    end else begin
-                                        enq_ptr = enq_ptr + 1'b1;
-                                    end
-                                    q_count_next = q_count_next + 1'b1;
-                                end
-                            end
-                            q_tail_next = enq_ptr;
-                            if (ENABLE_PREVIEW_RESERVE) begin
-                                q_reserved_next = q_reserved_next - bank_hit_count[QUEUE_COUNT_WIDTH-1:0];
-                            end
-                        end
-
                         for (pipe_idx = ADD_LATENCY-1; pipe_idx > 0; pipe_idx = pipe_idx - 1) begin
                             bank_valid_pipe[pipe_idx] <= bank_valid_pipe[pipe_idx-1];
                             bank_addr_pipe[pipe_idx] <= bank_addr_pipe[pipe_idx-1];
@@ -517,23 +539,78 @@ module y_acc_banks #(
                         bank_addr_pipe[0] <= bank_issue_fire ? bank_issue_addr : {BANK_ADDR_WIDTH{1'b0}};
 
                         if (bank_issue_fire) begin
-                            bank_q_valid[bank_q_head] <= 1'b0;
-                            if (q_head_next == QUEUE_DEPTH-1) begin
-                                q_head_next = {QUEUE_PTR_WIDTH{1'b0}};
-                            end else begin
-                                q_head_next = q_head_next + 1'b1;
+                            for (shift_idx = 0; shift_idx < QUEUE_DEPTH-1; shift_idx = shift_idx + 1) begin
+                                if (shift_idx >= bank_issue_slot) begin
+                                    if (shift_idx < (bank_q_count - 1)) begin
+                                        bank_q_valid[shift_idx] <= bank_q_valid[shift_idx+1];
+                                        bank_q_addr[shift_idx] <= bank_q_addr[shift_idx+1];
+                                        bank_q_data[shift_idx] <= bank_q_data[shift_idx+1];
+                                    end else if (shift_idx == (bank_q_count - 1)) begin
+                                        bank_q_valid[shift_idx] <= 1'b0;
+                                        bank_q_addr[shift_idx] <= {BANK_ADDR_WIDTH{1'b0}};
+                                        bank_q_data[shift_idx] <= {DATA_WIDTH{1'b0}};
+                                    end
+                                end
                             end
                             q_count_next = q_count_next - 1'b1;
                         end
 
-                        bank_q_head <= q_head_next;
-                        bank_q_tail <= q_tail_next;
+                        if (merged_enqueue_fire && (!ENABLE_PREVIEW_RESERVE ? acc_ready_vec[bank_idx] : 1'b1)) begin
+                            enq_ptr = q_count_next[QUEUE_PTR_WIDTH-1:0];
+                            for (enqueue_idx = 0; enqueue_idx < UPDATE_CHANNELS; enqueue_idx = enqueue_idx + 1) begin
+                                if (merged_pp_valid[enqueue_idx] &&
+                                    (merged_pp_bank[enqueue_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
+                                    bank_q_valid[enq_ptr] <= 1'b1;
+                                    bank_q_addr[enq_ptr] <= merged_pp_bank_addr[enqueue_idx];
+                                    bank_q_data[enq_ptr] <= merged_pp_data[enqueue_idx];
+                                    enq_ptr = enq_ptr + 1'b1;
+                                    q_count_next = q_count_next + 1'b1;
+                                end
+                            end
+                            if (ENABLE_PREVIEW_RESERVE) begin
+                                q_reserved_next = q_reserved_next - bank_hit_count[QUEUE_COUNT_WIDTH-1:0];
+                            end
+                        end
+
+                        bank_q_head <= {QUEUE_PTR_WIDTH{1'b0}};
+                        bank_q_tail <= q_count_next[QUEUE_PTR_WIDTH-1:0];
                         bank_q_count <= q_count_next;
                         bank_reserved_count <= q_reserved_next;
+
+                        if ((|preview_valid_all) && !bank_ready && (preview_bank_hit_count != 0)) begin
+                            stat_ready_block_count <= stat_ready_block_count + 1;
+                            if (preview_bank_hit_count > queue_space) begin
+                                stat_ready_block_deficit_sum <= stat_ready_block_deficit_sum + (preview_bank_hit_count - queue_space);
+                            end
+                        end
+                        if (bank_issue_fire) begin
+                            stat_issue_fire_count <= stat_issue_fire_count + 1;
+                            if (bank_issue_slot == {QUEUE_PTR_WIDTH{1'b0}}) begin
+                                stat_issue_head_pick_count <= stat_issue_head_pick_count + 1;
+                            end else begin
+                                stat_issue_bypass_pick_count <= stat_issue_bypass_pick_count + 1;
+                            end
+                        end else if ((bank_q_count != 0) && bank_window_has_candidate) begin
+                            stat_issue_conflict_block_count <= stat_issue_conflict_block_count + 1;
+                        end
 
                         if (bank_result_valid) begin
                             bank_ram[bank_addr_pipe[ADD_LATENCY-1]] <= bank_new_data;
                         end
+                    end
+
+                    if ((mode == 2'b11) && ls_en && !stat_stall_dumped_local) begin
+                        $display("STALL_STATS bank=%0d ready_block=%0d deficit_sum=%0d issue_fire=%0d issue_head=%0d issue_bypass=%0d issue_conflict_block=%0d",
+                                 bank_idx,
+                                 stat_ready_block_count,
+                                 stat_ready_block_deficit_sum,
+                                 stat_issue_fire_count,
+                                 stat_issue_head_pick_count,
+                                 stat_issue_bypass_pick_count,
+                                 stat_issue_conflict_block_count);
+                        stat_stall_dumped_local <= 1'b1;
+                    end else if (mode != 2'b11) begin
+                        stat_stall_dumped_local <= 1'b0;
                     end
                 end
             end
@@ -569,12 +646,16 @@ module y_acc_banks #(
             reg bank_head_conflict;
             reg [BANK_ADDR_WIDTH-1:0] bank_issue_addr;
             reg [DATA_WIDTH-1:0] bank_issue_data;
+            reg [QUEUE_PTR_WIDTH-1:0] bank_issue_slot;
             reg bank_ready;
             reg bank_idle;
             reg [QUEUE_PTR_WIDTH-1:0] q_head_next;
             reg [QUEUE_PTR_WIDTH-1:0] q_tail_next;
             reg [QUEUE_COUNT_WIDTH-1:0] q_count_next;
             reg [QUEUE_PTR_WIDTH-1:0] enq_ptr;
+            integer issue_sel_idx;
+            integer shift_idx;
+            integer issue_limit;
 
             wire [ADDR_WIDTH:0] abs_idx = (ls_addr * PARALLELISM) + bank_idx;
             wire bank_in_range = (abs_idx < DEPTH);
@@ -598,29 +679,49 @@ module y_acc_banks #(
                         end
                     end
 
-                queue_space = QUEUE_DEPTH - bank_q_count;
-                bank_ready = (queue_space >= bank_hit_count);
-                bank_idle = (bank_q_count == 0);
-                for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
-                    if (bank_valid_pipe[pipe_idx]) begin
-                        bank_idle = 1'b0;
-                    end
-                end
-
-                bank_issue_fire = 1'b0;
-                bank_head_conflict = 1'b0;
-                bank_issue_addr = bank_q_addr[bank_q_head];
-                bank_issue_data = bank_q_data[bank_q_head];
-
-                if ((mode == 2'b10) && (bank_q_count != 0) && bank_q_valid[bank_q_head]) begin
+                    queue_space = QUEUE_DEPTH - bank_q_count;
+                    bank_ready = (queue_space >= bank_hit_count);
+                    bank_idle = (bank_q_count == 0);
                     for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
-                        if (bank_valid_pipe[pipe_idx] && (bank_addr_pipe[pipe_idx] == bank_q_addr[bank_q_head])) begin
-                            bank_head_conflict = 1'b1;
+                        if (bank_valid_pipe[pipe_idx]) begin
+                            bank_idle = 1'b0;
                         end
                     end
-                    bank_issue_fire = !bank_head_conflict;
+
+                    bank_issue_fire = 1'b0;
+                    bank_head_conflict = 1'b0;
+                    bank_issue_slot = {QUEUE_PTR_WIDTH{1'b0}};
+                    bank_issue_addr = bank_q_addr[0];
+                    bank_issue_data = bank_q_data[0];
+
+                    if (mode == 2'b10) begin
+                        issue_limit = 0;
+                        if (bank_q_count != 0) begin
+                            if (ENABLE_LIMITED_BYPASS) begin
+                                issue_limit = (bank_q_count < LIMITED_BYPASS_WINDOW) ? bank_q_count : LIMITED_BYPASS_WINDOW;
+                            end else begin
+                                issue_limit = 1;
+                            end
+                        end
+
+                        for (issue_sel_idx = 0; issue_sel_idx < issue_limit; issue_sel_idx = issue_sel_idx + 1) begin
+                            bank_head_conflict = 1'b0;
+                            if (bank_q_valid[issue_sel_idx]) begin
+                                for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
+                                    if (bank_valid_pipe[pipe_idx] && (bank_addr_pipe[pipe_idx] == bank_q_addr[issue_sel_idx])) begin
+                                        bank_head_conflict = 1'b1;
+                                    end
+                                end
+                                if (!bank_issue_fire && !bank_head_conflict) begin
+                                    bank_issue_fire = 1'b1;
+                                    bank_issue_slot = issue_sel_idx[QUEUE_PTR_WIDTH-1:0];
+                                    bank_issue_addr = bank_q_addr[issue_sel_idx];
+                                    bank_issue_data = bank_q_data[issue_sel_idx];
+                                end
+                            end
+                        end
+                    end
                 end
-            end
 
             assign bank_old_data = bank_ram[bank_issue_addr];
             assign unused_status = &{1'b0, bank_status};
@@ -685,26 +786,6 @@ module y_acc_banks #(
                     q_tail_next = bank_q_tail;
                     q_count_next = bank_q_count;
 
-                    if (enqueue_fire && acc_ready_vec[bank_idx]) begin
-                        enq_ptr = bank_q_tail;
-                        for (enqueue_idx = 0; enqueue_idx < UPDATE_CHANNELS; enqueue_idx = enqueue_idx + 1) begin
-                            if (pp_valid_all[enqueue_idx] &&
-                                (addr[enqueue_idx] < DEPTH) &&
-                                (bank_sel[enqueue_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
-                                bank_q_valid[enq_ptr] <= 1'b1;
-                                bank_q_addr[enq_ptr] <= bank_addr[enqueue_idx];
-                                bank_q_data[enq_ptr] <= pp[enqueue_idx];
-                                if (enq_ptr == QUEUE_DEPTH-1) begin
-                                    enq_ptr = {QUEUE_PTR_WIDTH{1'b0}};
-                                end else begin
-                                    enq_ptr = enq_ptr + 1'b1;
-                                end
-                                q_count_next = q_count_next + 1'b1;
-                            end
-                        end
-                        q_tail_next = enq_ptr;
-                    end
-
                     for (pipe_idx = ADD_LATENCY-1; pipe_idx > 0; pipe_idx = pipe_idx - 1) begin
                         bank_valid_pipe[pipe_idx] <= bank_valid_pipe[pipe_idx-1];
                         bank_addr_pipe[pipe_idx] <= bank_addr_pipe[pipe_idx-1];
@@ -713,17 +794,39 @@ module y_acc_banks #(
                     bank_addr_pipe[0] <= bank_issue_fire ? bank_issue_addr : {BANK_ADDR_WIDTH{1'b0}};
 
                     if (bank_issue_fire) begin
-                        bank_q_valid[bank_q_head] <= 1'b0;
-                        if (q_head_next == QUEUE_DEPTH-1) begin
-                            q_head_next = {QUEUE_PTR_WIDTH{1'b0}};
-                        end else begin
-                            q_head_next = q_head_next + 1'b1;
+                        for (shift_idx = 0; shift_idx < QUEUE_DEPTH-1; shift_idx = shift_idx + 1) begin
+                            if (shift_idx >= bank_issue_slot) begin
+                                if (shift_idx < (bank_q_count - 1)) begin
+                                    bank_q_valid[shift_idx] <= bank_q_valid[shift_idx+1];
+                                    bank_q_addr[shift_idx] <= bank_q_addr[shift_idx+1];
+                                    bank_q_data[shift_idx] <= bank_q_data[shift_idx+1];
+                                end else if (shift_idx == (bank_q_count - 1)) begin
+                                    bank_q_valid[shift_idx] <= 1'b0;
+                                    bank_q_addr[shift_idx] <= {BANK_ADDR_WIDTH{1'b0}};
+                                    bank_q_data[shift_idx] <= {DATA_WIDTH{1'b0}};
+                                end
+                            end
                         end
                         q_count_next = q_count_next - 1'b1;
                     end
 
-                    bank_q_head <= q_head_next;
-                    bank_q_tail <= q_tail_next;
+                    if (enqueue_fire && acc_ready_vec[bank_idx]) begin
+                        enq_ptr = q_count_next[QUEUE_PTR_WIDTH-1:0];
+                        for (enqueue_idx = 0; enqueue_idx < UPDATE_CHANNELS; enqueue_idx = enqueue_idx + 1) begin
+                            if (pp_valid_all[enqueue_idx] &&
+                                (addr[enqueue_idx] < DEPTH) &&
+                                (bank_sel[enqueue_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
+                                bank_q_valid[enq_ptr] <= 1'b1;
+                                bank_q_addr[enq_ptr] <= bank_addr[enqueue_idx];
+                                bank_q_data[enq_ptr] <= pp[enqueue_idx];
+                                enq_ptr = enq_ptr + 1'b1;
+                                q_count_next = q_count_next + 1'b1;
+                            end
+                        end
+                    end
+
+                    bank_q_head <= {QUEUE_PTR_WIDTH{1'b0}};
+                    bank_q_tail <= q_count_next[QUEUE_PTR_WIDTH-1:0];
                     bank_q_count <= q_count_next;
 
                     if (bank_result_valid) begin
@@ -736,3 +839,4 @@ module y_acc_banks #(
 `endif
 
 endmodule
+

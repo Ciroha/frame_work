@@ -48,6 +48,7 @@ module b8c_top #(
     parameter SIM_USE_ADD_IP = 1'b1,     // 仿真时加法: 1=IP, 0=行为模型
     parameter SIM_ENABLE_BANK_STATS = 1'b0,      // 仿真时输出bank热点统计
     parameter SIM_PRINT_BATCH_BANK_STATS = 1'b0, // 仿真时输出每batch bank命中
+    parameter SIM_ENABLE_STALL_REASON_STATS = 1'b0,
     parameter VECTOR_DEPTH = 4096,       // X向量存储深度
     parameter Y_ELEMS      = 23,         // Y向量元素个数
     parameter ADDR_WIDTH   = ((((VECTOR_DEPTH > Y_ELEMS) ? VECTOR_DEPTH : Y_ELEMS) <= 1) ?
@@ -658,7 +659,9 @@ module b8c_top #(
         .SIM_USE_IP(SIM_USE_ADD_IP),
         .ENABLE_PREVIEW_RESERVE(CONTINUOUS_ISSUE_MODE),
         .SIM_ENABLE_BANK_STATS(SIM_ENABLE_BANK_STATS),
-        .SIM_PRINT_BATCH_BANK_STATS(SIM_PRINT_BATCH_BANK_STATS)
+        .SIM_PRINT_BATCH_BANK_STATS(SIM_PRINT_BATCH_BANK_STATS),
+        .SIM_ENABLE_STALL_REASON_STATS(SIM_ENABLE_STALL_REASON_STATS),
+        .ENABLE_LIMITED_BYPASS(CONTINUOUS_ISSUE_MODE)
     ) u_y_acc (
         .clk(clk),
         .mode(y_mode),

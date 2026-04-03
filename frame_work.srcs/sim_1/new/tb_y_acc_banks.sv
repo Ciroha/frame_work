@@ -7,7 +7,7 @@ module tb_y_acc_banks #(
 
     localparam PARALLELISM = 8;
     localparam DATA_WIDTH  = 64;
-    localparam DEPTH       = 32;
+    localparam DEPTH       = 80;
     localparam ADDR_WIDTH  = $clog2(DEPTH);
 
     localparam [63:0] FP64_ZERO  = 64'h0000_0000_0000_0000;
@@ -41,7 +41,8 @@ module tb_y_acc_banks #(
         .DATA_WIDTH(DATA_WIDTH),
         .DEPTH(DEPTH),
         .ADDR_WIDTH(ADDR_WIDTH),
-        .QUEUE_DEPTH(2)
+        .QUEUE_DEPTH(8),
+        .ENABLE_LIMITED_BYPASS(1'b1)
     ) dut (
         .clk(clk),
         .mode(mode),
@@ -89,6 +90,10 @@ module tb_y_acc_banks #(
         case_same_bank_same_addr;
         clear_memory;
         case_same_bank_diff_addr;
+        clear_memory;
+        case_head_bypass_issue;
+        clear_memory;
+        case_head_bypass_window_limit;
         clear_memory;
         case_bank_credit_boundary;
 
@@ -152,6 +157,33 @@ module tb_y_acc_banks #(
         end
     endtask
 
+    task drive_compute_pulse;
+        input [PARALLELISM*DATA_WIDTH-1:0] in_pp_a;
+        input [PARALLELISM-1:0]            in_valid_a;
+        input [PARALLELISM*ADDR_WIDTH-1:0] in_addr_a;
+        input [PARALLELISM*DATA_WIDTH-1:0] in_pp_b;
+        input [PARALLELISM-1:0]            in_valid_b;
+        input [PARALLELISM*ADDR_WIDTH-1:0] in_addr_b;
+        begin
+            mode = 2'b10;
+            partial_products_a = in_pp_a;
+            pp_valid_a = in_valid_a;
+            y_local_addr_a = in_addr_a;
+            partial_products_b = in_pp_b;
+            pp_valid_b = in_valid_b;
+            y_local_addr_b = in_addr_b;
+            batch_fire = 1'b1;
+            @(posedge clk);
+            partial_products_a = {PARALLELISM*DATA_WIDTH{1'b0}};
+            pp_valid_a = {PARALLELISM{1'b0}};
+            y_local_addr_a = {PARALLELISM*ADDR_WIDTH{1'b0}};
+            partial_products_b = {PARALLELISM*DATA_WIDTH{1'b0}};
+            pp_valid_b = {PARALLELISM{1'b0}};
+            y_local_addr_b = {PARALLELISM*ADDR_WIDTH{1'b0}};
+            batch_fire = 1'b0;
+        end
+    endtask
+
     task read_store_beat;
         input [ADDR_WIDTH-1:0] beat_addr;
         output [PARALLELISM*DATA_WIDTH-1:0] beat_data;
@@ -187,12 +219,12 @@ module tb_y_acc_banks #(
             drive_compute_once(
                 {FP64_ONE, FP64_ONE, FP64_ONE, FP64_ONE, FP64_ONE, FP64_ONE, FP64_ONE, FP64_ONE},
                 8'b1111_1111,
-                {5'd7, 5'd6, 5'd5, 5'd4, 5'd3, 5'd2, 5'd1, 5'd0},
+                {7'd7, 7'd6, 7'd5, 7'd4, 7'd3, 7'd2, 7'd1, 7'd0},
                 {PARALLELISM*DATA_WIDTH{1'b0}},
                 {PARALLELISM{1'b0}},
                 {PARALLELISM*ADDR_WIDTH{1'b0}}
             );
-            read_store_beat(5'd0, beat0);
+            read_store_beat(7'd0, beat0);
             expect_word(beat0[ 63:  0], FP64_ONE, "unique lane0");
             expect_word(beat0[127: 64], FP64_ONE, "unique lane1");
             expect_word(beat0[191:128], FP64_ONE, "unique lane2");
@@ -211,12 +243,12 @@ module tb_y_acc_banks #(
             drive_compute_once(
                 {{7{FP64_ZERO}}, FP64_ONE},
                 8'b0000_0001,
-                {{7{5'd0}}, 5'd0},
+                {{7{7'd0}}, 7'd0},
                 {{7{FP64_ZERO}}, FP64_TWO},
                 8'b0000_0001,
-                {{7{5'd0}}, 5'd0}
+                {{7{7'd0}}, 7'd0}
             );
-            read_store_beat(5'd0, beat0);
+            read_store_beat(7'd0, beat0);
             expect_word(beat0[ 63:  0], FP64_THREE, "same addr lane0");
             expect_word(beat0[127: 64], FP64_ZERO,  "same addr lane1");
         end
@@ -230,31 +262,85 @@ module tb_y_acc_banks #(
             drive_compute_once(
                 {{6{FP64_ZERO}}, FP64_TWO, FP64_ONE},
                 8'b0000_0011,
-                {{6{5'd0}}, 5'd8, 5'd0},
+                {{6{7'd0}}, 7'd8, 7'd0},
                 {PARALLELISM*DATA_WIDTH{1'b0}},
                 {PARALLELISM{1'b0}},
                 {PARALLELISM*ADDR_WIDTH{1'b0}}
             );
-            read_store_beat(5'd0, beat0);
-            read_store_beat(5'd1, beat1);
+            read_store_beat(7'd0, beat0);
+            read_store_beat(7'd1, beat1);
             expect_word(beat0[ 63:  0], FP64_ONE, "diff addr beat0 lane0");
             expect_word(beat1[ 63:  0], FP64_TWO, "diff addr beat1 lane0");
+        end
+    endtask
+
+    task case_head_bypass_issue;
+        reg [PARALLELISM*DATA_WIDTH-1:0] beat0;
+        reg [PARALLELISM*DATA_WIDTH-1:0] beat1;
+        integer observed;
+        begin
+            $display("CASE head bypass issue");
+            drive_compute_pulse({{7{FP64_ZERO}}, FP64_ONE}, 8'b0000_0001, {{7{7'd0}}, 7'd0}, {PARALLELISM*DATA_WIDTH{1'b0}}, {PARALLELISM{1'b0}}, {PARALLELISM*ADDR_WIDTH{1'b0}});
+            drive_compute_pulse({{6{FP64_ZERO}}, FP64_ONE, FP64_ONE}, 8'b0000_0011, {{6{7'd0}}, 7'd8, 7'd0}, {PARALLELISM*DATA_WIDTH{1'b0}}, {PARALLELISM{1'b0}}, {PARALLELISM*ADDR_WIDTH{1'b0}});
+            observed = 0;
+            repeat (2) begin
+                @(posedge clk);
+                #1;
+                if ((dut.gen_acc_ip_sim.gen_y_bank[0].bank_q_count == 1) &&
+                    dut.gen_acc_ip_sim.gen_y_bank[0].bank_q_valid[0] &&
+                    (dut.gen_acc_ip_sim.gen_y_bank[0].bank_q_addr[0] == 4'd0) &&
+                    ((dut.gen_acc_ip_sim.gen_y_bank[0].bank_valid_pipe[0] && (dut.gen_acc_ip_sim.gen_y_bank[0].bank_addr_pipe[0] == 4'd1)) ||
+                     (dut.gen_acc_ip_sim.gen_y_bank[0].bank_valid_pipe[1] && (dut.gen_acc_ip_sim.gen_y_bank[0].bank_addr_pipe[1] == 4'd1)))) begin
+                    observed = 1;
+                end
+            end
+            if (!observed) begin
+                $error("head bypass issue did not observe addr1 bypass around conflicting addr0");
+                errors = errors + 1;
+            end
+            wait (acc_idle);
+            @(posedge clk);
+            mode = 2'b00;
+            read_store_beat(7'd0, beat0);
+            read_store_beat(7'd1, beat1);
+            expect_word(beat0[ 63:  0], FP64_TWO, "bypass beat0 lane0");
+            expect_word(beat1[ 63:  0], FP64_ONE, "bypass beat1 lane0");
+        end
+    endtask
+
+    task case_head_bypass_window_limit;
+        begin
+            $display("CASE head bypass window limit");
+            drive_compute_pulse({{7{FP64_ZERO}}, FP64_ONE}, 8'b0000_0001, {{7{7'd0}}, 7'd0}, {PARALLELISM*DATA_WIDTH{1'b0}}, {PARALLELISM{1'b0}}, {PARALLELISM*ADDR_WIDTH{1'b0}});
+            drive_compute_pulse({{7{FP64_ZERO}}, FP64_ONE}, 8'b0000_0001, {{7{7'd0}}, 7'd8}, {PARALLELISM*DATA_WIDTH{1'b0}}, {PARALLELISM{1'b0}}, {PARALLELISM*ADDR_WIDTH{1'b0}});
+            drive_compute_pulse({{7{FP64_ZERO}}, FP64_ONE}, 8'b0000_0001, {{7{7'd0}}, 7'd16}, {PARALLELISM*DATA_WIDTH{1'b0}}, {PARALLELISM{1'b0}}, {PARALLELISM*ADDR_WIDTH{1'b0}});
+            drive_compute_pulse({{7{FP64_ZERO}}, FP64_ONE}, 8'b0000_0001, {{7{7'd0}}, 7'd24}, {PARALLELISM*DATA_WIDTH{1'b0}}, {PARALLELISM{1'b0}}, {PARALLELISM*ADDR_WIDTH{1'b0}});
+            drive_compute_pulse({{3{FP64_ZERO}}, FP64_ONE, FP64_ONE, FP64_ONE, FP64_ONE, FP64_ONE}, 8'b0001_1111, {{3{7'd0}}, 7'd32, 7'd24, 7'd16, 7'd8, 7'd0}, {PARALLELISM*DATA_WIDTH{1'b0}}, {PARALLELISM{1'b0}}, {PARALLELISM*ADDR_WIDTH{1'b0}});
+            @(posedge clk);
+            #1;
+            if (dut.gen_acc_ip_sim.gen_y_bank[0].bank_valid_pipe[0]) begin
+                $error("window limit exp no issue when first 4 slots conflict");
+                errors = errors + 1;
+            end
+            wait (acc_idle);
+            @(posedge clk);
+            mode = 2'b00;
         end
     endtask
 
     task case_bank_credit_boundary;
         reg [PARALLELISM*DATA_WIDTH-1:0] beat0;
         reg [PARALLELISM*DATA_WIDTH-1:0] beat1;
-        reg [PARALLELISM*DATA_WIDTH-1:0] beat2;
+        reg [PARALLELISM*DATA_WIDTH-1:0] beat8;
         begin
             $display("CASE bank credit boundary");
             mode = 2'b10;
-            partial_products_a = {FP64_ZERO, FP64_ZERO, FP64_ZERO, FP64_ZERO, FP64_ZERO, FP64_ONE, FP64_ONE, FP64_ONE};
-            pp_valid_a = 8'b0000_0111;
-            y_local_addr_a = {5'd0, 5'd0, 5'd0, 5'd0, 5'd0, 5'd16, 5'd8, 5'd0};
-            partial_products_b = {PARALLELISM*DATA_WIDTH{1'b0}};
-            pp_valid_b = {PARALLELISM{1'b0}};
-            y_local_addr_b = {PARALLELISM*ADDR_WIDTH{1'b0}};
+            partial_products_a = {FP64_ONE, FP64_ONE, FP64_ONE, FP64_ONE, FP64_ONE, FP64_ONE, FP64_ONE, FP64_ONE};
+            pp_valid_a = 8'hFF;
+            y_local_addr_a = {7'd56, 7'd48, 7'd40, 7'd32, 7'd24, 7'd16, 7'd8, 7'd0};
+            partial_products_b = {{7{FP64_ZERO}}, FP64_ONE};
+            pp_valid_b = 8'b0000_0001;
+            y_local_addr_b = {{7{7'd0}}, 7'd64};
             batch_fire = 1'b1;
 
             #1;
@@ -267,16 +353,19 @@ module tb_y_acc_banks #(
             partial_products_a = {PARALLELISM*DATA_WIDTH{1'b0}};
             pp_valid_a = {PARALLELISM{1'b0}};
             y_local_addr_a = {PARALLELISM*ADDR_WIDTH{1'b0}};
+            partial_products_b = {PARALLELISM*DATA_WIDTH{1'b0}};
+            pp_valid_b = {PARALLELISM{1'b0}};
+            y_local_addr_b = {PARALLELISM*ADDR_WIDTH{1'b0}};
             batch_fire = 1'b0;
             mode = 2'b00;
             @(posedge clk);
 
-            read_store_beat(5'd0, beat0);
-            read_store_beat(5'd1, beat1);
-            read_store_beat(5'd2, beat2);
+            read_store_beat(7'd0, beat0);
+            read_store_beat(7'd1, beat1);
+            read_store_beat(7'd8, beat8);
             expect_word(beat0[ 63:  0], FP64_ZERO, "credit boundary beat0 lane0");
             expect_word(beat1[ 63:  0], FP64_ZERO, "credit boundary beat1 lane0");
-            expect_word(beat2[ 63:  0], FP64_ZERO, "credit boundary beat2 lane0");
+            expect_word(beat8[ 63:  0], FP64_ZERO, "credit boundary beat8 lane0");
         end
     endtask
 

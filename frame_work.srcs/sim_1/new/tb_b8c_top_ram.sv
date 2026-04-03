@@ -10,6 +10,7 @@ module tb_b8c_top_ram();
     parameter SIM_USE_ADD_IP = 1'b1;
     parameter SIM_ENABLE_BANK_STATS = 1'b1;
     parameter SIM_PRINT_BATCH_BANK_STATS = 1'b0;
+    parameter SIM_ENABLE_STALL_REASON_STATS = 1'b1;
     parameter DECOUPLE_ID_META = 1'b0;
     parameter ID_Q_DEPTH   = 8;
     parameter META_Q_DEPTH = 8;
@@ -73,6 +74,7 @@ module tb_b8c_top_ram();
         .SIM_USE_ADD_IP(SIM_USE_ADD_IP),
         .SIM_ENABLE_BANK_STATS(SIM_ENABLE_BANK_STATS),
         .SIM_PRINT_BATCH_BANK_STATS(SIM_PRINT_BATCH_BANK_STATS),
+        .SIM_ENABLE_STALL_REASON_STATS(SIM_ENABLE_STALL_REASON_STATS),
         .LUT_INIT_FILE(LUT_FILE),
         .DECOUPLE_ID_META(DECOUPLE_ID_META),
         .ID_Q_DEPTH(ID_Q_DEPTH),
