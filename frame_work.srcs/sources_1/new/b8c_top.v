@@ -149,6 +149,7 @@ module b8c_top #(
     reg [PARALLELISM*16-1:0]          dec_row_deltas_pipe [0:META_OUT_STAGE];
     reg [15:0]                        dec_row_base_pipe [0:META_OUT_STAGE];
     reg [15:0]                        dec_col_base_pipe [0:META_OUT_STAGE];
+    reg [PARALLELISM-1:0]             dec_nonzero_pipe [0:META_OUT_STAGE];
     wire                              acc_ready;
     wire                              acc_idle;
     wire                              dec_ready_out;
@@ -171,6 +172,7 @@ module b8c_top #(
                 dec_row_deltas_pipe[pipe_idx] <= {PARALLELISM*16{1'b0}};
                 dec_row_base_pipe[pipe_idx]   <= 16'd0;
                 dec_col_base_pipe[pipe_idx]   <= 16'd0;
+                dec_nonzero_pipe[pipe_idx]    <= {PARALLELISM{1'b0}};
             end
         end else if (state == S_COMPUTE) begin
             compute_inflight_pipe[0] <= compute_fire;
@@ -187,16 +189,21 @@ module b8c_top #(
                 dec_row_deltas_pipe[0] <= dec_row_deltas;
                 dec_row_base_pipe[0]   <= dec_row_base;
                 dec_col_base_pipe[0]   <= dec_col_base;
+                for (pipe_idx = 0; pipe_idx < PARALLELISM; pipe_idx = pipe_idx + 1) begin
+                    dec_nonzero_pipe[0][pipe_idx] <= (dec_vals[pipe_idx*DATA_WIDTH +: DATA_WIDTH] != {DATA_WIDTH{1'b0}});
+                end
             end else begin
                 dec_row_deltas_pipe[0] <= {PARALLELISM*16{1'b0}};
                 dec_row_base_pipe[0]   <= 16'd0;
                 dec_col_base_pipe[0]   <= 16'd0;
+                dec_nonzero_pipe[0]    <= {PARALLELISM{1'b0}};
             end
 
             for (pipe_idx = 1; pipe_idx <= META_OUT_STAGE; pipe_idx = pipe_idx + 1) begin
                 dec_row_deltas_pipe[pipe_idx] <= dec_row_deltas_pipe[pipe_idx-1];
                 dec_row_base_pipe[pipe_idx]   <= dec_row_base_pipe[pipe_idx-1];
                 dec_col_base_pipe[pipe_idx]   <= dec_col_base_pipe[pipe_idx-1];
+                dec_nonzero_pipe[pipe_idx]    <= dec_nonzero_pipe[pipe_idx-1];
             end
         end else begin
             dec_vals_d1 <= {PARALLELISM*DATA_WIDTH{1'b0}};
@@ -208,6 +215,7 @@ module b8c_top #(
                 dec_row_deltas_pipe[pipe_idx] <= {PARALLELISM*16{1'b0}};
                 dec_row_base_pipe[pipe_idx]   <= 16'd0;
                 dec_col_base_pipe[pipe_idx]   <= 16'd0;
+                dec_nonzero_pipe[pipe_idx]    <= {PARALLELISM{1'b0}};
             end
         end
     end
@@ -533,6 +541,7 @@ module b8c_top #(
     wire [PARALLELISM*ADDR_WIDTH-1:0] y_preview_addr;      // 当前batch预览Y地址
     wire [PARALLELISM*ADDR_WIDTH-1:0] y_preview_addr_sym;  // 当前batch预览对称Y地址
     wire [PARALLELISM-1:0]            y_sym_diag_mask;     // 对角线掩码(对角线元素不重复计算)
+    wire [PARALLELISM-1:0]            pp_valid_sym_masked; // 对称路径最终有效掩码
     generate
         for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_y_addr
             wire [15:0] delta_p = dec_row_deltas[i*16 +: 16];
@@ -551,6 +560,57 @@ module b8c_top #(
             assign y_sym_diag_mask[i] = (row_abs_d == col_abs_d);
         end
     endgenerate
+
+    generate
+        for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_sym_valid_mask
+            assign pp_valid_sym_masked[i] =
+                pp_valid_sym[i] &
+                SYMMETRIC_UPPER_ONLY &
+                dec_nonzero_pipe[META_OUT_STAGE][i] &
+                ~y_sym_diag_mask[i];
+        end
+    endgenerate
+
+`ifndef SYNTHESIS
+    integer sym_dbg_issue_count;
+    integer sym_dbg_retire_count;
+    initial begin
+        sym_dbg_issue_count = 0;
+        sym_dbg_retire_count = 0;
+    end
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            sym_dbg_issue_count <= 0;
+            sym_dbg_retire_count <= 0;
+        end else if (SYMMETRIC_UPPER_ONLY) begin
+            if (compute_valid_d2 && (sym_dbg_issue_count < 8)) begin
+                $display("SYMDBG_ISSUE idx=%0d row_base=%0d col_base=%0d x_main0=%h x_sym0=%h mat0=%h",
+                         sym_dbg_issue_count,
+                         dec_row_base_pipe[2],
+                         dec_col_base_pipe[2],
+                         x_rd_data[0 +: DATA_WIDTH],
+                         x_sym_rd_data[0 +: DATA_WIDTH],
+                         dec_vals_d2[0 +: DATA_WIDTH]);
+                sym_dbg_issue_count <= sym_dbg_issue_count + 1;
+            end
+            if ((|pp_valid_main || |pp_valid_sym || |pp_valid_sym_masked) && (sym_dbg_retire_count < 8)) begin
+                $display("SYMDBG_RETIRE idx=%0d main=%h sym=%h masked=%h diag=%h nz=%h y_addr_a0=%0d y_addr_b0=%0d pp_main0=%h pp_sym0=%h",
+                         sym_dbg_retire_count,
+                         pp_valid_main,
+                         pp_valid_sym,
+                         pp_valid_sym_masked,
+                         y_sym_diag_mask,
+                         dec_nonzero_pipe[META_OUT_STAGE],
+                         y_compute_addr[0 +: ADDR_WIDTH],
+                         y_compute_addr_sym[0 +: ADDR_WIDTH],
+                         pp_data_main[0 +: DATA_WIDTH],
+                         pp_data_sym[0 +: DATA_WIDTH]);
+                sym_dbg_retire_count <= sym_dbg_retire_count + 1;
+            end
+        end
+    end
+`endif
 
     // ========================================================================
     // Y向量加载逻辑
@@ -682,7 +742,7 @@ module b8c_top #(
         .y_local_addr_a(y_compute_addr),
         // 对称路径累加: Y[col] += A[row,col] * X[row]
         .partial_products_b(pp_data_sym),
-        .pp_valid_b(pp_valid_sym & {PARALLELISM{SYMMETRIC_UPPER_ONLY}} & ~y_sym_diag_mask),
+        .pp_valid_b(pp_valid_sym_masked),
         .y_local_addr_b(y_compute_addr_sym)
     );
 

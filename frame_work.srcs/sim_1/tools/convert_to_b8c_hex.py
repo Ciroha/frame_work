@@ -94,14 +94,14 @@ def pack_axi_beat_u8_lane0_first(ids_lane0_first: Sequence[int]) -> str:
     return s
 
 
-def build_value_id_stream_hex(mapped_ids: Sequence[int]) -> List[str]:
+def build_value_id_stream_hex(mapped_ids: Sequence[int], pad_id: int = 0) -> List[str]:
     if not mapped_ids:
         return []
     lines: List[str] = []
     for i in range(0, len(mapped_ids), ID_PER_AXI_BEAT):
         chunk = list(mapped_ids[i : i + ID_PER_AXI_BEAT])
         if len(chunk) < ID_PER_AXI_BEAT:
-            chunk.extend([0] * (ID_PER_AXI_BEAT - len(chunk)))
+            chunk.extend([pad_id] * (ID_PER_AXI_BEAT - len(chunk)))
         lines.append(pack_axi_beat_u8_lane0_first(chunk))
     return lines
 
@@ -165,6 +165,10 @@ def build_value_dictionary_and_map(
     if extra_u64.size > 0:
         final_unique = np.concatenate([unique_u64, extra_u64]).astype(np.uint64, copy=False)
 
+    zero_bits = np.uint64(f64_to_u64(0.0))
+    if value_stream_values is not None and not np.isin(zero_bits, final_unique, assume_unique=False):
+        final_unique = np.concatenate([final_unique, np.array([zero_bits], dtype=np.uint64)])
+
     if final_unique.size > 256:
         msg = "独特值过多，超出 8-bit ID 容量"
         print(f"Warning: {msg} (count={final_unique.size})")
@@ -177,13 +181,14 @@ def build_value_dictionary_and_map(
     write_lines(os.path.join(out_dir, lut_filename), lut_lines)
 
     value_to_id: Dict[int, int] = {int(bits): idx for idx, bits in enumerate(final_unique.tolist())}
+    zero_id = value_to_id[int(zero_bits)]
 
     mapped_ids = np.fromiter((value_to_id[int(bits)] for bits in data_u64.tolist()), dtype=np.uint8)
 
     if value_stream_values is not None:
         stream_u64 = np.asarray(value_stream_values, dtype=np.float64).view(np.uint64)
         stream_ids = np.fromiter((value_to_id[int(bits)] for bits in stream_u64.tolist()), dtype=np.uint8)
-        mapped_lines = build_value_id_stream_hex(stream_ids.tolist())
+        mapped_lines = build_value_id_stream_hex(stream_ids.tolist(), pad_id=zero_id)
     else:
         mapped_lines = build_value_id_stream_hex(mapped_ids.tolist())
     write_lines(os.path.join(out_dir, mapped_stream_filename), mapped_lines)
@@ -399,6 +404,10 @@ def build_compute_id_stream(beats: Sequence[Beat], value_to_id: Dict[int, int]) 
 
     ids_per_block = VAL_BATCH * LANES
     id_beats_per_block = math.ceil(ids_per_block / ID_PER_AXI_BEAT)
+    zero_bits = int(f64_to_u64(0.0))
+    if zero_bits not in value_to_id:
+        raise KeyError("zero value bits missing in LUT mapping for ID-stream padding")
+    zero_id = value_to_id[zero_bits]
 
     # Stream order:
     # [ID beats for 16 value beats][5 metadata beats]...
@@ -416,12 +425,12 @@ def build_compute_id_stream(beats: Sequence[Beat], value_to_id: Dict[int, int]) 
         for i in range(0, len(block_ids), ID_PER_AXI_BEAT):
             sub = block_ids[i : i + ID_PER_AXI_BEAT]
             if len(sub) < ID_PER_AXI_BEAT:
-                sub = sub + [0] * (ID_PER_AXI_BEAT - len(sub))
+                sub = sub + [zero_id] * (ID_PER_AXI_BEAT - len(sub))
             lines.append(pack_axi_beat_u8_lane0_first(sub))
 
         # Defensive pad, in case ids_per_block is not exactly divisible by ID_PER_AXI_BEAT.
         while (len(lines) % (id_beats_per_block + META_BATCH)) < id_beats_per_block:
-            lines.append(pack_axi_beat_u8_lane0_first([0] * ID_PER_AXI_BEAT))
+            lines.append(pack_axi_beat_u8_lane0_first([zero_id] * ID_PER_AXI_BEAT))
 
         lines.extend(build_meta_lines_for_chunk(chunk))
 
