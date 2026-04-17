@@ -155,7 +155,9 @@ module b8c_top #(
     wire                              dec_ready_out;
     wire                              compute_req_next;
     wire                              compute_fire;
-    reg  [FP64_MUL_LATENCY-1:0]       compute_inflight_pipe;
+    // Keep the busy window long enough to cover compute_valid_d2
+    // and the FP64 multiply output retirement into y_acc_banks.
+    reg  [COMPUTE_DRAIN_CYCLES-1:0]    compute_inflight_pipe;
     wire                              compute_mul_busy;
     integer                           pipe_idx;
 
@@ -167,7 +169,7 @@ module b8c_top #(
             dec_vals_d2 <= {PARALLELISM*DATA_WIDTH{1'b0}};
             compute_valid_d1 <= 1'b0;
             compute_valid_d2 <= 1'b0;
-            compute_inflight_pipe <= {FP64_MUL_LATENCY{1'b0}};
+            compute_inflight_pipe <= {COMPUTE_DRAIN_CYCLES{1'b0}};
             for (pipe_idx = 0; pipe_idx <= META_OUT_STAGE; pipe_idx = pipe_idx + 1) begin
                 dec_row_deltas_pipe[pipe_idx] <= {PARALLELISM*16{1'b0}};
                 dec_row_base_pipe[pipe_idx]   <= 16'd0;
@@ -176,7 +178,7 @@ module b8c_top #(
             end
         end else if (state == S_COMPUTE) begin
             compute_inflight_pipe[0] <= compute_fire;
-            for (pipe_idx = 1; pipe_idx < FP64_MUL_LATENCY; pipe_idx = pipe_idx + 1) begin
+            for (pipe_idx = 1; pipe_idx < COMPUTE_DRAIN_CYCLES; pipe_idx = pipe_idx + 1) begin
                 compute_inflight_pipe[pipe_idx] <= compute_inflight_pipe[pipe_idx-1];
             end
 
@@ -210,7 +212,7 @@ module b8c_top #(
             dec_vals_d2 <= {PARALLELISM*DATA_WIDTH{1'b0}};
             compute_valid_d1 <= 1'b0;
             compute_valid_d2 <= 1'b0;
-            compute_inflight_pipe <= {FP64_MUL_LATENCY{1'b0}};
+            compute_inflight_pipe <= {COMPUTE_DRAIN_CYCLES{1'b0}};
             for (pipe_idx = 0; pipe_idx <= META_OUT_STAGE; pipe_idx = pipe_idx + 1) begin
                 dec_row_deltas_pipe[pipe_idx] <= {PARALLELISM*16{1'b0}};
                 dec_row_base_pipe[pipe_idx]   <= 16'd0;

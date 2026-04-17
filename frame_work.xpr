@@ -61,7 +61,7 @@
     <Option Name="EnableBDX" Val="FALSE"/>
     <Option Name="DSABoardId" Val="v80"/>
     <Option Name="NextGenVersal" Val="TRUE"/>
-    <Option Name="WTXSimLaunchSim" Val="151"/>
+    <Option Name="WTXSimLaunchSim" Val="153"/>
     <Option Name="WTModelSimLaunchSim" Val="0"/>
     <Option Name="WTQuestaLaunchSim" Val="0"/>
     <Option Name="WTIesLaunchSim" Val="0"/>
@@ -312,18 +312,18 @@
         <Option Name="xsim.simulate.log_all_signals" Val="true"/>
         <Generic Name="PARALLELISM" Val="16"/>
         <Generic Name="MODE_ID52" Val="1"/>
-        <Generic Name="SYMMETRIC_UPPER_ONLY" Val="1"/>
+        <Generic Name="SYMMETRIC_UPPER_ONLY" Val="0"/>
         <Generic Name="SIM_USE_MUL_IP" Val="0"/>
         <Generic Name="SIM_USE_ADD_IP" Val="0"/>
         <Generic Name="VECTOR_DEPTH" Val="256"/>
         <Generic Name="Y_ELEMS" Val="4096"/>
-        <Generic Name="MAT_DATA_BEATS" Val="3304"/>
-        <Generic Name="X_STREAM_FILE" Val="C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/x_stream.hex"/>
-        <Generic Name="Y_STREAM_FILE" Val="C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/y_stream.hex"/>
-        <Generic Name="COMPUTE_STREAM_FILE" Val="C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/compute_stream.hex"/>
-        <Generic Name="COMPUTE_ID_STREAM_FILE" Val="C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/compute_id_stream.hex"/>
-        <Generic Name="LUT_FILE" Val="C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/lut.hex"/>
-        <Generic Name="GOLDEN_Y_FILE" Val="C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/golden_y.hex"/>
+        <Generic Name="MAT_DATA_BEATS" Val="6352"/>
+        <Generic Name="X_STREAM_FILE" Val="C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/x_stream.hex"/>
+        <Generic Name="Y_STREAM_FILE" Val="C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/y_stream.hex"/>
+        <Generic Name="COMPUTE_STREAM_FILE" Val="C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/compute_stream.hex"/>
+        <Generic Name="COMPUTE_ID_STREAM_FILE" Val="C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/compute_id_stream.hex"/>
+        <Generic Name="LUT_FILE" Val="C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/lut.hex"/>
+        <Generic Name="GOLDEN_Y_FILE" Val="C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16/golden_y.hex"/>
       </Config>
     </FileSet>
     <FileSet Name="utils_1" Type="Utils" RelSrcDir="$PSRCDIR/utils_1" RelGenDir="$PGENDIR/utils_1">
