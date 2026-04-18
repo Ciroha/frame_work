@@ -90,7 +90,9 @@ module b8c_top #(
     localparam integer FP64_MUL_LATENCY = 8;      // FP64乘法IP固定延迟
     localparam integer META_OUT_STAGE = FP64_MUL_LATENCY + 1; // 元数据对齐到乘法输出
     localparam integer COMPUTE_DRAIN_CYCLES = FP64_MUL_LATENCY + 3;  // 计算流水线排空周期数
-    localparam CONTINUOUS_ISSUE_MODE = MODE_ID52 && (PARALLELISM == 8) && !SYMMETRIC_UPPER_ONLY;
+    localparam CONTINUOUS_ISSUE_MODE = MODE_ID52 &&
+                                       ((PARALLELISM == 8) || (PARALLELISM == 16)) &&
+                                       !SYMMETRIC_UPPER_ONLY;
     localparam integer IO_LANES = AXI_WIDTH / DATA_WIDTH;  // 每拍传输的数据个数(8)
     localparam integer LANE_RATIO = PARALLELISM / IO_LANES; // 并行度与IO比例(1或2)
     localparam integer X_AXI_BEATS = VECTOR_DEPTH * LANE_RATIO; // X向量传输拍数
