@@ -93,6 +93,10 @@ module b8c_top #(
     localparam CONTINUOUS_ISSUE_MODE = MODE_ID52 &&
                                        ((PARALLELISM == 8) || (PARALLELISM == 16)) &&
                                        !SYMMETRIC_UPPER_ONLY;
+    localparam SYMM_CONTINUOUS_ISSUE_MODE = MODE_ID52 &&
+                                            (PARALLELISM == 16) &&
+                                            SYMMETRIC_UPPER_ONLY;
+    localparam CONTINUOUS_ADMISSION_MODE = CONTINUOUS_ISSUE_MODE || SYMM_CONTINUOUS_ISSUE_MODE;
     localparam integer IO_LANES = AXI_WIDTH / DATA_WIDTH;  // 每拍传输的数据个数(8)
     localparam integer LANE_RATIO = PARALLELISM / IO_LANES; // 并行度与IO比例(1或2)
     localparam integer X_AXI_BEATS = VECTOR_DEPTH * LANE_RATIO; // X向量传输拍数
@@ -354,9 +358,9 @@ module b8c_top #(
     // 解码器接口信号
     // ========================================================================
     wire axis_to_dec_valid = (state == S_COMPUTE) && s_axis_tvalid; // 计算阶段才允许解码
-    // Continuous-issue mode is enabled only for the validated non-symmetric
-    // LUT-ID path. Other modes keep the conservative drain-based gating.
-    assign compute_req_next = CONTINUOUS_ISSUE_MODE ?
+    // Continuous admission is enabled only for validated/gated ID paths.
+    // Other modes keep the conservative drain-based gating.
+    assign compute_req_next = CONTINUOUS_ADMISSION_MODE ?
                               ((state == S_COMPUTE) && acc_ready) :
                               ((state == S_COMPUTE) && acc_idle && !compute_mul_busy);
     assign compute_fire = decoder_val && compute_req_next;
@@ -544,6 +548,9 @@ module b8c_top #(
     wire [PARALLELISM*ADDR_WIDTH-1:0] y_compute_addr_sym;  // 对称路径Y地址
     wire [PARALLELISM*ADDR_WIDTH-1:0] y_preview_addr;      // 当前batch预览Y地址
     wire [PARALLELISM*ADDR_WIDTH-1:0] y_preview_addr_sym;  // 当前batch预览对称Y地址
+    wire [PARALLELISM-1:0]            y_preview_valid;     // 主路径预留有效掩码
+    wire [PARALLELISM-1:0]            y_preview_valid_sym; // 对称路径预留有效掩码
+    wire [PARALLELISM-1:0]            pp_valid_main_acc;   // 主路径最终累加有效掩码
     wire [PARALLELISM-1:0]            y_sym_diag_mask;     // 对角线掩码(对角线元素不重复计算)
     wire [PARALLELISM-1:0]            pp_valid_sym_masked; // 对称路径最终有效掩码
     generate
@@ -554,8 +561,17 @@ module b8c_top #(
             wire [15:0] delta_d = dec_row_deltas_pipe[META_OUT_STAGE][i*16 +: 16];
             wire [15:0] row_abs_d = dec_row_base_pipe[META_OUT_STAGE] + delta_d;  // 绝对行地址
             wire [15:0] col_abs_d = dec_col_base_pipe[META_OUT_STAGE] + i;         // 绝对列地址
+            wire        dec_nonzero_p = (dec_vals[i*DATA_WIDTH +: DATA_WIDTH] != {DATA_WIDTH{1'b0}});
             assign y_preview_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = row_abs_p[ADDR_WIDTH-1:0];
             assign y_preview_addr_sym[i*ADDR_WIDTH +: ADDR_WIDTH] = col_abs_p[ADDR_WIDTH-1:0];
+            assign y_preview_valid[i] =
+                CONTINUOUS_ISSUE_MODE ? decoder_val :
+                (SYMM_CONTINUOUS_ISSUE_MODE && decoder_val && dec_nonzero_p && (row_abs_p < Y_ELEMS));
+            assign y_preview_valid_sym[i] =
+                SYMM_CONTINUOUS_ISSUE_MODE && decoder_val &&
+                dec_nonzero_p &&
+                (row_abs_p != col_abs_p) &&
+                (col_abs_p < Y_ELEMS);
             // 主路径: 按行累加 Y[row] += A[row,col] * X[col]
             assign y_compute_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = row_abs_d[ADDR_WIDTH-1:0];
             // 对称路径: 按列累加 Y[col] += A[row,col] * X[row] (利用对称性)
@@ -567,27 +583,64 @@ module b8c_top #(
 
     generate
         for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_sym_valid_mask
+            wire [15:0] delta_d = dec_row_deltas_pipe[META_OUT_STAGE][i*16 +: 16];
+            wire [15:0] row_abs_d = dec_row_base_pipe[META_OUT_STAGE] + delta_d;
+            wire [15:0] col_abs_d = dec_col_base_pipe[META_OUT_STAGE] + i;
+            assign pp_valid_main_acc[i] =
+                pp_valid_main[i] &
+                (!SYMM_CONTINUOUS_ISSUE_MODE ||
+                 (dec_nonzero_pipe[META_OUT_STAGE][i] && (row_abs_d < Y_ELEMS)));
             assign pp_valid_sym_masked[i] =
                 pp_valid_sym[i] &
                 SYMMETRIC_UPPER_ONLY &
                 dec_nonzero_pipe[META_OUT_STAGE][i] &
-                ~y_sym_diag_mask[i];
+                ~y_sym_diag_mask[i] &
+                (!SYMM_CONTINUOUS_ISSUE_MODE || (col_abs_d < Y_ELEMS));
         end
     endgenerate
 
 `ifndef SYNTHESIS
     integer sym_dbg_issue_count;
     integer sym_dbg_retire_count;
+    reg [PARALLELISM-1:0] preview_valid_a_pipe [0:META_OUT_STAGE];
+    reg [PARALLELISM-1:0] preview_valid_b_pipe [0:META_OUT_STAGE];
+    reg [PARALLELISM*ADDR_WIDTH-1:0] preview_addr_a_pipe [0:META_OUT_STAGE];
+    reg [PARALLELISM*ADDR_WIDTH-1:0] preview_addr_b_pipe [0:META_OUT_STAGE];
+    integer preview_pipe_idx;
+    integer preview_check_idx;
     initial begin
         sym_dbg_issue_count = 0;
         sym_dbg_retire_count = 0;
+        for (preview_pipe_idx = 0; preview_pipe_idx <= META_OUT_STAGE; preview_pipe_idx = preview_pipe_idx + 1) begin
+            preview_valid_a_pipe[preview_pipe_idx] = {PARALLELISM{1'b0}};
+            preview_valid_b_pipe[preview_pipe_idx] = {PARALLELISM{1'b0}};
+            preview_addr_a_pipe[preview_pipe_idx] = {PARALLELISM*ADDR_WIDTH{1'b0}};
+            preview_addr_b_pipe[preview_pipe_idx] = {PARALLELISM*ADDR_WIDTH{1'b0}};
+        end
     end
 
     always @(posedge clk) begin
         if (!rst_n) begin
             sym_dbg_issue_count <= 0;
             sym_dbg_retire_count <= 0;
+            for (preview_pipe_idx = 0; preview_pipe_idx <= META_OUT_STAGE; preview_pipe_idx = preview_pipe_idx + 1) begin
+                preview_valid_a_pipe[preview_pipe_idx] <= {PARALLELISM{1'b0}};
+                preview_valid_b_pipe[preview_pipe_idx] <= {PARALLELISM{1'b0}};
+                preview_addr_a_pipe[preview_pipe_idx] <= {PARALLELISM*ADDR_WIDTH{1'b0}};
+                preview_addr_b_pipe[preview_pipe_idx] <= {PARALLELISM*ADDR_WIDTH{1'b0}};
+            end
         end else if (SYMMETRIC_UPPER_ONLY) begin
+            preview_valid_a_pipe[0] <= compute_fire ? y_preview_valid : {PARALLELISM{1'b0}};
+            preview_valid_b_pipe[0] <= compute_fire ? y_preview_valid_sym : {PARALLELISM{1'b0}};
+            preview_addr_a_pipe[0] <= compute_fire ? y_preview_addr : {PARALLELISM*ADDR_WIDTH{1'b0}};
+            preview_addr_b_pipe[0] <= compute_fire ? y_preview_addr_sym : {PARALLELISM*ADDR_WIDTH{1'b0}};
+            for (preview_pipe_idx = 1; preview_pipe_idx <= META_OUT_STAGE; preview_pipe_idx = preview_pipe_idx + 1) begin
+                preview_valid_a_pipe[preview_pipe_idx] <= preview_valid_a_pipe[preview_pipe_idx-1];
+                preview_valid_b_pipe[preview_pipe_idx] <= preview_valid_b_pipe[preview_pipe_idx-1];
+                preview_addr_a_pipe[preview_pipe_idx] <= preview_addr_a_pipe[preview_pipe_idx-1];
+                preview_addr_b_pipe[preview_pipe_idx] <= preview_addr_b_pipe[preview_pipe_idx-1];
+            end
+
             if (compute_valid_d2 && (sym_dbg_issue_count < 8)) begin
                 $display("SYMDBG_ISSUE idx=%0d row_base=%0d col_base=%0d x_main0=%h x_sym0=%h mat0=%h",
                          sym_dbg_issue_count,
@@ -611,6 +664,39 @@ module b8c_top #(
                          pp_data_main[0 +: DATA_WIDTH],
                          pp_data_sym[0 +: DATA_WIDTH]);
                 sym_dbg_retire_count <= sym_dbg_retire_count + 1;
+            end
+
+            if (SYMM_CONTINUOUS_ISSUE_MODE) begin
+                for (preview_check_idx = 0; preview_check_idx < PARALLELISM; preview_check_idx = preview_check_idx + 1) begin
+                    if (preview_valid_a_pipe[META_OUT_STAGE][preview_check_idx] !== pp_valid_main_acc[preview_check_idx]) begin
+                        $error("SYM_PREVIEW_A_VALID mismatch lane=%0d exp=%0b got=%0b",
+                               preview_check_idx,
+                               preview_valid_a_pipe[META_OUT_STAGE][preview_check_idx],
+                               pp_valid_main_acc[preview_check_idx]);
+                    end
+                    if (preview_valid_b_pipe[META_OUT_STAGE][preview_check_idx] !== pp_valid_sym_masked[preview_check_idx]) begin
+                        $error("SYM_PREVIEW_B_VALID mismatch lane=%0d exp=%0b got=%0b",
+                               preview_check_idx,
+                               preview_valid_b_pipe[META_OUT_STAGE][preview_check_idx],
+                               pp_valid_sym_masked[preview_check_idx]);
+                    end
+                    if (preview_valid_a_pipe[META_OUT_STAGE][preview_check_idx] &&
+                        (preview_addr_a_pipe[META_OUT_STAGE][preview_check_idx*ADDR_WIDTH +: ADDR_WIDTH] !=
+                         y_compute_addr[preview_check_idx*ADDR_WIDTH +: ADDR_WIDTH])) begin
+                        $error("SYM_PREVIEW_A_ADDR mismatch lane=%0d exp=%0d got=%0d",
+                               preview_check_idx,
+                               preview_addr_a_pipe[META_OUT_STAGE][preview_check_idx*ADDR_WIDTH +: ADDR_WIDTH],
+                               y_compute_addr[preview_check_idx*ADDR_WIDTH +: ADDR_WIDTH]);
+                    end
+                    if (preview_valid_b_pipe[META_OUT_STAGE][preview_check_idx] &&
+                        (preview_addr_b_pipe[META_OUT_STAGE][preview_check_idx*ADDR_WIDTH +: ADDR_WIDTH] !=
+                         y_compute_addr_sym[preview_check_idx*ADDR_WIDTH +: ADDR_WIDTH])) begin
+                        $error("SYM_PREVIEW_B_ADDR mismatch lane=%0d exp=%0d got=%0d",
+                               preview_check_idx,
+                               preview_addr_b_pipe[META_OUT_STAGE][preview_check_idx*ADDR_WIDTH +: ADDR_WIDTH],
+                               y_compute_addr_sym[preview_check_idx*ADDR_WIDTH +: ADDR_WIDTH]);
+                    end
+                end
             end
         end
     end
@@ -721,11 +807,11 @@ module b8c_top #(
         .DATA_WIDTH(DATA_WIDTH),
         .ADDR_WIDTH(ADDR_WIDTH),
         .SIM_USE_IP(SIM_USE_ADD_IP),
-        .ENABLE_PREVIEW_RESERVE(CONTINUOUS_ISSUE_MODE),
+        .ENABLE_PREVIEW_RESERVE(CONTINUOUS_ADMISSION_MODE),
         .SIM_ENABLE_BANK_STATS(SIM_ENABLE_BANK_STATS),
         .SIM_PRINT_BATCH_BANK_STATS(SIM_PRINT_BATCH_BANK_STATS),
         .SIM_ENABLE_STALL_REASON_STATS(SIM_ENABLE_STALL_REASON_STATS),
-        .ENABLE_LIMITED_BYPASS(CONTINUOUS_ISSUE_MODE)
+        .ENABLE_LIMITED_BYPASS(CONTINUOUS_ADMISSION_MODE)
     ) u_y_acc (
         .clk(clk),
         .mode(y_mode),
@@ -736,13 +822,13 @@ module b8c_top #(
         .acc_ready(acc_ready),
         .acc_idle(acc_idle),
         .batch_fire(compute_fire),
-        .preview_valid_a({PARALLELISM{CONTINUOUS_ISSUE_MODE && decoder_val}}),
+        .preview_valid_a(y_preview_valid),
         .preview_y_local_addr_a(y_preview_addr),
-        .preview_valid_b({PARALLELISM{1'b0}}),
-        .preview_y_local_addr_b({PARALLELISM*ADDR_WIDTH{1'b0}}),
+        .preview_valid_b(y_preview_valid_sym),
+        .preview_y_local_addr_b(y_preview_addr_sym),
         // 主路径累加: Y[row] += A[row,col] * X[col]
         .partial_products_a(pp_data_main),
-        .pp_valid_a(pp_valid_main),
+        .pp_valid_a(pp_valid_main_acc),
         .y_local_addr_a(y_compute_addr),
         // 对称路径累加: Y[col] += A[row,col] * X[row]
         .partial_products_b(pp_data_sym),

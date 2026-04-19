@@ -14,6 +14,7 @@ module tb_b8c_top_ram();
     parameter DECOUPLE_ID_META = 1'b0;
     parameter ID_Q_DEPTH   = 8;
     parameter META_Q_DEPTH = 8;
+    parameter real Y_ABS_TOL = 0.0;
     parameter VECTOR_DEPTH = 512;
     parameter Y_ELEMS      = 4096;
     parameter MAT_DATA_BEATS = 12704;
@@ -204,16 +205,42 @@ module tb_b8c_top_ram();
 
                 for (int lane = 0; lane < IO_LANES; lane++) begin
                     logic [63:0] act;
+                    real act_real;
+                    real exp_real;
+                    real abs_err;
+                    bit act_nan;
+                    bit exp_nan;
                     act = m_axis_tdata[lane*64 +: 64];
                     if ($isunknown(act)) begin
                         $error("Y contains X/Z at scalar %0d: got=%h", scalar_idx, act);
                         error_count++;
                     end
                     if (enable_data_check && (scalar_idx < Y_ELEMS)) begin
-                        if (act !== golden_y_bits[scalar_idx]) begin
-                            $error("Y mismatch at scalar %0d: exp=%h got=%h",
-                                   scalar_idx, golden_y_bits[scalar_idx], act);
-                            error_count++;
+                        if (Y_ABS_TOL == 0.0) begin
+                            if (act !== golden_y_bits[scalar_idx]) begin
+                                $error("Y mismatch at scalar %0d: exp=%h got=%h",
+                                       scalar_idx, golden_y_bits[scalar_idx], act);
+                                error_count++;
+                            end
+                        end else begin
+                            act_nan = (&act[62:52]) && (|act[51:0]);
+                            exp_nan = (&golden_y_bits[scalar_idx][62:52]) && (|golden_y_bits[scalar_idx][51:0]);
+                            if (act_nan || exp_nan) begin
+                                if (act !== golden_y_bits[scalar_idx]) begin
+                                    $error("Y NaN mismatch at scalar %0d: exp=%h got=%h",
+                                           scalar_idx, golden_y_bits[scalar_idx], act);
+                                    error_count++;
+                                end
+                            end else begin
+                            act_real = $bitstoreal(act);
+                            exp_real = $bitstoreal(golden_y_bits[scalar_idx]);
+                            abs_err = (act_real >= exp_real) ? (act_real - exp_real) : (exp_real - act_real);
+                            if (abs_err > Y_ABS_TOL) begin
+                                $error("Y mismatch at scalar %0d: exp=%h got=%h abs_err=%0.12e tol=%0.12e",
+                                       scalar_idx, golden_y_bits[scalar_idx], act, abs_err, Y_ABS_TOL);
+                                error_count++;
+                            end
+                            end
                         end
                     end else if (scalar_idx >= Y_ELEMS) begin
                         if (act !== FP64_0_0) begin
