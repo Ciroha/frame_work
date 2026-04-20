@@ -8,6 +8,7 @@ module y_acc_banks #(
     parameter SIM_USE_IP  = 1'b1,
     parameter ENABLE_PREVIEW_RESERVE = 1'b1,
     parameter QUEUE_DEPTH = 256,
+    parameter LIMITED_BYPASS_WINDOW = 4,
     parameter SIM_ENABLE_BANK_STATS = 1'b0,
     parameter SIM_PRINT_BATCH_BANK_STATS = 1'b0,
     parameter SIM_ENABLE_STALL_REASON_STATS = 1'b0,
@@ -41,7 +42,6 @@ module y_acc_banks #(
     localparam integer ADD_LATENCY = 8;
     localparam integer QUEUE_PTR_WIDTH = $clog2(QUEUE_DEPTH);
     localparam integer QUEUE_COUNT_WIDTH = $clog2(QUEUE_DEPTH + 1);
-    localparam integer LIMITED_BYPASS_WINDOW = 4;
 
     reg [PARALLELISM*DATA_WIDTH-1:0] r_store_data;
     assign store_data = r_store_data;
@@ -89,6 +89,10 @@ module y_acc_banks #(
     reg [QUEUE_COUNT_WIDTH-1:0]      merged_pp_bank_hit_count [0:PARALLELISM-1];
     reg [QUEUE_COUNT_WIDTH-1:0]      raw_preview_bank_hit_count [0:PARALLELISM-1];
     reg [QUEUE_COUNT_WIDTH-1:0]      raw_pp_bank_hit_count [0:PARALLELISM-1];
+    reg [QUEUE_COUNT_WIDTH-1:0]      raw_preview_bank_hit_count_a [0:PARALLELISM-1];
+    reg [QUEUE_COUNT_WIDTH-1:0]      raw_preview_bank_hit_count_b [0:PARALLELISM-1];
+    reg [QUEUE_COUNT_WIDTH-1:0]      merged_preview_bank_hit_count_a [0:PARALLELISM-1];
+    reg [QUEUE_COUNT_WIDTH-1:0]      merged_preview_bank_hit_count_b [0:PARALLELISM-1];
     real                             merged_pp_sum_real [0:UPDATE_CHANNELS-1];
     integer                          merge_bank_idx;
     integer                          merge_idx;
@@ -106,6 +110,10 @@ module y_acc_banks #(
     integer                          stat_rejected_batches;
     integer                          stat_raw_total [0:PARALLELISM-1];
     integer                          stat_merged_total [0:PARALLELISM-1];
+    integer                          stat_raw_total_a [0:PARALLELISM-1];
+    integer                          stat_raw_total_b [0:PARALLELISM-1];
+    integer                          stat_merged_total_a [0:PARALLELISM-1];
+    integer                          stat_merged_total_b [0:PARALLELISM-1];
     integer                          stat_raw_max [0:PARALLELISM-1];
     integer                          stat_merged_max [0:PARALLELISM-1];
     integer                          stat_raw_hot_count [0:PARALLELISM-1];
@@ -131,6 +139,10 @@ module y_acc_banks #(
             merged_pp_bank_hit_count[merge_bank_idx] = {QUEUE_COUNT_WIDTH{1'b0}};
             raw_preview_bank_hit_count[merge_bank_idx] = {QUEUE_COUNT_WIDTH{1'b0}};
             raw_pp_bank_hit_count[merge_bank_idx] = {QUEUE_COUNT_WIDTH{1'b0}};
+            raw_preview_bank_hit_count_a[merge_bank_idx] = {QUEUE_COUNT_WIDTH{1'b0}};
+            raw_preview_bank_hit_count_b[merge_bank_idx] = {QUEUE_COUNT_WIDTH{1'b0}};
+            merged_preview_bank_hit_count_a[merge_bank_idx] = {QUEUE_COUNT_WIDTH{1'b0}};
+            merged_preview_bank_hit_count_b[merge_bank_idx] = {QUEUE_COUNT_WIDTH{1'b0}};
         end
 
         merge_preview_idx = 0;
@@ -138,6 +150,13 @@ module y_acc_banks #(
             if (preview_valid_all[merge_idx] && (preview_addr[merge_idx] < DEPTH)) begin
                 raw_preview_bank_hit_count[preview_bank_sel[merge_idx]] =
                     raw_preview_bank_hit_count[preview_bank_sel[merge_idx]] + 1'b1;
+                if (merge_idx < PARALLELISM) begin
+                    raw_preview_bank_hit_count_a[preview_bank_sel[merge_idx]] =
+                        raw_preview_bank_hit_count_a[preview_bank_sel[merge_idx]] + 1'b1;
+                end else begin
+                    raw_preview_bank_hit_count_b[preview_bank_sel[merge_idx]] =
+                        raw_preview_bank_hit_count_b[preview_bank_sel[merge_idx]] + 1'b1;
+                end
                 merge_preview_match = -1;
                 for (merge_insert_idx = 0; merge_insert_idx < merge_preview_idx; merge_insert_idx = merge_insert_idx + 1) begin
                     if (merged_preview_valid[merge_insert_idx] &&
@@ -152,6 +171,13 @@ module y_acc_banks #(
                     merged_preview_bank[merge_preview_idx] = preview_bank_sel[merge_idx];
                     merged_preview_bank_hit_count[preview_bank_sel[merge_idx]] =
                         merged_preview_bank_hit_count[preview_bank_sel[merge_idx]] + 1'b1;
+                    if (merge_idx < PARALLELISM) begin
+                        merged_preview_bank_hit_count_a[preview_bank_sel[merge_idx]] =
+                            merged_preview_bank_hit_count_a[preview_bank_sel[merge_idx]] + 1'b1;
+                    end else begin
+                        merged_preview_bank_hit_count_b[preview_bank_sel[merge_idx]] =
+                            merged_preview_bank_hit_count_b[preview_bank_sel[merge_idx]] + 1'b1;
+                    end
                     merge_preview_idx = merge_preview_idx + 1;
                 end
             end
@@ -200,6 +226,10 @@ module y_acc_banks #(
         for (stat_idx = 0; stat_idx < PARALLELISM; stat_idx = stat_idx + 1) begin
             stat_raw_total[stat_idx] = 0;
             stat_merged_total[stat_idx] = 0;
+            stat_raw_total_a[stat_idx] = 0;
+            stat_raw_total_b[stat_idx] = 0;
+            stat_merged_total_a[stat_idx] = 0;
+            stat_merged_total_b[stat_idx] = 0;
             stat_raw_max[stat_idx] = 0;
             stat_merged_max[stat_idx] = 0;
             stat_raw_hot_count[stat_idx] = 0;
@@ -215,10 +245,14 @@ module y_acc_banks #(
                         $display("BANK_STATS batches preview=%0d accepted=%0d rejected=%0d",
                                  stat_preview_batches, stat_accepted_batches, stat_rejected_batches);
                         for (stat_idx = 0; stat_idx < PARALLELISM; stat_idx = stat_idx + 1) begin
-                            $display("BANK_STATS bank=%0d raw_total=%0d merged_total=%0d raw_max=%0d merged_max=%0d raw_hot=%0d merged_hot=%0d",
+                            $display("BANK_STATS bank=%0d raw_total=%0d raw_a=%0d raw_b=%0d merged_total=%0d merged_a=%0d merged_b=%0d raw_max=%0d merged_max=%0d raw_hot=%0d merged_hot=%0d",
                                      stat_idx,
                                      stat_raw_total[stat_idx],
+                                     stat_raw_total_a[stat_idx],
+                                     stat_raw_total_b[stat_idx],
                                      stat_merged_total[stat_idx],
+                                     stat_merged_total_a[stat_idx],
+                                     stat_merged_total_b[stat_idx],
                                      stat_raw_max[stat_idx],
                                      stat_merged_max[stat_idx],
                                      stat_raw_hot_count[stat_idx],
@@ -254,6 +288,10 @@ module y_acc_banks #(
                 for (stat_idx = 0; stat_idx < PARALLELISM; stat_idx = stat_idx + 1) begin
                     stat_raw_total[stat_idx] <= stat_raw_total[stat_idx] + raw_preview_bank_hit_count[stat_idx];
                     stat_merged_total[stat_idx] <= stat_merged_total[stat_idx] + merged_preview_bank_hit_count[stat_idx];
+                    stat_raw_total_a[stat_idx] <= stat_raw_total_a[stat_idx] + raw_preview_bank_hit_count_a[stat_idx];
+                    stat_raw_total_b[stat_idx] <= stat_raw_total_b[stat_idx] + raw_preview_bank_hit_count_b[stat_idx];
+                    stat_merged_total_a[stat_idx] <= stat_merged_total_a[stat_idx] + merged_preview_bank_hit_count_a[stat_idx];
+                    stat_merged_total_b[stat_idx] <= stat_merged_total_b[stat_idx] + merged_preview_bank_hit_count_b[stat_idx];
                     if (raw_preview_bank_hit_count[stat_idx] > stat_raw_max[stat_idx]) begin
                         stat_raw_max[stat_idx] <= raw_preview_bank_hit_count[stat_idx];
                     end
@@ -380,6 +418,9 @@ module y_acc_banks #(
                 integer issue_limit;
                 integer stat_ready_block_count;
                 integer stat_ready_block_deficit_sum;
+                integer stat_preview_reject_count;
+                integer stat_queue_high_watermark;
+                integer stat_reserved_high_watermark;
                 integer stat_issue_fire_count;
                 integer stat_issue_head_pick_count;
                 integer stat_issue_bypass_pick_count;
@@ -482,6 +523,9 @@ module y_acc_banks #(
                     bank_q_tail = {QUEUE_PTR_WIDTH{1'b0}};
                     stat_ready_block_count = 0;
                     stat_ready_block_deficit_sum = 0;
+                    stat_preview_reject_count = 0;
+                    stat_queue_high_watermark = 0;
+                    stat_reserved_high_watermark = 0;
                     stat_issue_fire_count = 0;
                     stat_issue_head_pick_count = 0;
                     stat_issue_bypass_pick_count = 0;
@@ -577,6 +621,15 @@ module y_acc_banks #(
                         bank_q_count <= q_count_next;
                         bank_reserved_count <= q_reserved_next;
 
+                        if (q_count_next > stat_queue_high_watermark) begin
+                            stat_queue_high_watermark <= q_count_next;
+                        end
+                        if (q_reserved_next > stat_reserved_high_watermark) begin
+                            stat_reserved_high_watermark <= q_reserved_next;
+                        end
+                        if ((preview_bank_hit_count != 0) && !batch_fire) begin
+                            stat_preview_reject_count <= stat_preview_reject_count + 1;
+                        end
                         if ((|preview_valid_all) && !bank_ready && (preview_bank_hit_count != 0)) begin
                             stat_ready_block_count <= stat_ready_block_count + 1;
                             if (preview_bank_hit_count > queue_space) begin
@@ -600,8 +653,11 @@ module y_acc_banks #(
                     end
 
                     if ((mode == 2'b11) && ls_en && !stat_stall_dumped_local) begin
-                        $display("STALL_STATS bank=%0d ready_block=%0d deficit_sum=%0d issue_fire=%0d issue_head=%0d issue_bypass=%0d issue_conflict_block=%0d",
+                        $display("STALL_STATS bank=%0d queue_high=%0d reserved_high=%0d preview_reject=%0d ready_block=%0d deficit_sum=%0d issue_fire=%0d issue_head=%0d issue_bypass=%0d issue_conflict_block=%0d",
                                  bank_idx,
+                                 stat_queue_high_watermark,
+                                 stat_reserved_high_watermark,
+                                 stat_preview_reject_count,
                                  stat_ready_block_count,
                                  stat_ready_block_deficit_sum,
                                  stat_issue_fire_count,

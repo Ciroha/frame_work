@@ -46,6 +46,8 @@ module b8c_top #(
     parameter META_Q_DEPTH = 8,          // Meta队列深度
     parameter SIM_USE_MUL_IP = 1'b1,     // 仿真时乘法: 1=IP, 0=行为模型
     parameter SIM_USE_ADD_IP = 1'b1,     // 仿真时加法: 1=IP, 0=行为模型
+    parameter Y_QUEUE_DEPTH = 256,       // Y累加队列深度
+    parameter Y_LIMITED_BYPASS_WINDOW = 4, // Y累加旁路窗口
     parameter SIM_ENABLE_BANK_STATS = 1'b0,      // 仿真时输出bank热点统计
     parameter SIM_PRINT_BATCH_BANK_STATS = 1'b0, // 仿真时输出每batch bank命中
     parameter SIM_ENABLE_STALL_REASON_STATS = 1'b0,
@@ -806,6 +808,8 @@ module b8c_top #(
         .DEPTH(Y_ELEMS),
         .DATA_WIDTH(DATA_WIDTH),
         .ADDR_WIDTH(ADDR_WIDTH),
+        .QUEUE_DEPTH(Y_QUEUE_DEPTH),
+        .LIMITED_BYPASS_WINDOW(Y_LIMITED_BYPASS_WINDOW),
         .SIM_USE_IP(SIM_USE_ADD_IP),
         .ENABLE_PREVIEW_RESERVE(CONTINUOUS_ADMISSION_MODE),
         .SIM_ENABLE_BANK_STATS(SIM_ENABLE_BANK_STATS),

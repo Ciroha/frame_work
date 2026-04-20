@@ -3,21 +3,23 @@
 module tb_b8c_top_ram();
 
     parameter AXI_WIDTH    = 512;
-    parameter PARALLELISM  = 8;
+    parameter PARALLELISM  = 16;
     parameter MODE_ID52    = 1'b1;
-    parameter SYMMETRIC_UPPER_ONLY = 1'b0;
+    parameter SYMMETRIC_UPPER_ONLY = 1'b1;
     parameter SIM_USE_MUL_IP = 1'b1;
     parameter SIM_USE_ADD_IP = 1'b1;
+    parameter Y_QUEUE_DEPTH = 256;
+    parameter Y_LIMITED_BYPASS_WINDOW = 4;
     parameter SIM_ENABLE_BANK_STATS = 1'b1;
     parameter SIM_PRINT_BATCH_BANK_STATS = 1'b0;
     parameter SIM_ENABLE_STALL_REASON_STATS = 1'b1;
     parameter DECOUPLE_ID_META = 1'b0;
     parameter ID_Q_DEPTH   = 8;
     parameter META_Q_DEPTH = 8;
-    parameter real Y_ABS_TOL = 0.0;
-    parameter VECTOR_DEPTH = 512;
+    parameter real Y_ABS_TOL = 1e-9;
+    parameter VECTOR_DEPTH = 256;
     parameter Y_ELEMS      = 4096;
-    parameter MAT_DATA_BEATS = 12704;
+    parameter MAT_DATA_BEATS = 3304;
     localparam IO_LANES       = AXI_WIDTH / 64;
     localparam LANE_RATIO     = PARALLELISM / IO_LANES;
     localparam MAX_ADDR_ELEMS = (VECTOR_DEPTH > Y_ELEMS) ? VECTOR_DEPTH : Y_ELEMS;
@@ -33,12 +35,12 @@ module tb_b8c_top_ram();
     localparam ACTIVE_COMPUTE_BEATS = MODE_ID52 ? COMPUTE_ID_BEATS : COMPUTE_BEATS;
     localparam COMPUTE_STREAM_MEM_BEATS = (COMPUTE_BEATS > COMPUTE_ID_BEATS) ? COMPUTE_BEATS : COMPUTE_ID_BEATS;
 
-    parameter string X_STREAM_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1/x_stream.hex";
-    parameter string Y_STREAM_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1/y_stream.hex";
-    parameter string COMPUTE_STREAM_FILE = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1/compute_stream.hex";
-    parameter string COMPUTE_ID_STREAM_FILE = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1/compute_id_stream.hex";
-    parameter string LUT_FILE            = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1/lut.hex";
-    parameter string GOLDEN_Y_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1/golden_y.hex";
+    parameter string X_STREAM_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/x_stream.hex";
+    parameter string Y_STREAM_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/y_stream.hex";
+    parameter string COMPUTE_STREAM_FILE = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/compute_stream.hex";
+    parameter string COMPUTE_ID_STREAM_FILE = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/compute_id_stream.hex";
+    parameter string LUT_FILE            = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/lut.hex";
+    parameter string GOLDEN_Y_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/golden_y.hex";
 
     localparam [63:0] FP64_1_0 = 64'h3FF0_0000_0000_0000;
     localparam [63:0] FP64_2_0 = 64'h4000_0000_0000_0000;
@@ -73,6 +75,8 @@ module tb_b8c_top_ram();
         .SYMMETRIC_UPPER_ONLY(SYMMETRIC_UPPER_ONLY),
         .SIM_USE_MUL_IP(SIM_USE_MUL_IP),
         .SIM_USE_ADD_IP(SIM_USE_ADD_IP),
+        .Y_QUEUE_DEPTH(Y_QUEUE_DEPTH),
+        .Y_LIMITED_BYPASS_WINDOW(Y_LIMITED_BYPASS_WINDOW),
         .SIM_ENABLE_BANK_STATS(SIM_ENABLE_BANK_STATS),
         .SIM_PRINT_BATCH_BANK_STATS(SIM_PRINT_BATCH_BANK_STATS),
         .SIM_ENABLE_STALL_REASON_STATS(SIM_ENABLE_STALL_REASON_STATS),
@@ -130,6 +134,24 @@ module tb_b8c_top_ram();
         if ((MAT_DATA_BEATS % META_EMIT_BEATS) != 0) begin
             $fatal(1, "MAT_DATA_BEATS (%0d) must be a multiple of META_EMIT_BEATS (%0d)",
                    MAT_DATA_BEATS, META_EMIT_BEATS);
+        end
+
+        $display("TB_CONFIG AXI_WIDTH=%0d PARALLELISM=%0d MODE_ID52=%0d SYMMETRIC_UPPER_ONLY=%0d SIM_USE_MUL_IP=%0d SIM_USE_ADD_IP=%0d",
+                 AXI_WIDTH, PARALLELISM, MODE_ID52, SYMMETRIC_UPPER_ONLY, SIM_USE_MUL_IP, SIM_USE_ADD_IP);
+        $display("TB_CONFIG Y_QUEUE_DEPTH=%0d Y_LIMITED_BYPASS_WINDOW=%0d ID_Q_DEPTH=%0d META_Q_DEPTH=%0d Y_ABS_TOL=%0.12e",
+                 Y_QUEUE_DEPTH, Y_LIMITED_BYPASS_WINDOW, ID_Q_DEPTH, META_Q_DEPTH, Y_ABS_TOL);
+        $display("TB_FILES X=%s", X_STREAM_FILE);
+        $display("TB_FILES Y=%s", Y_STREAM_FILE);
+        if (MODE_ID52) begin
+            $display("TB_FILES COMPUTE_ID=%s", COMPUTE_ID_STREAM_FILE);
+            $display("TB_FILES LUT=%s", LUT_FILE);
+        end else begin
+            $display("TB_FILES COMPUTE=%s", COMPUTE_STREAM_FILE);
+        end
+        if (GOLDEN_Y_FILE != "") begin
+            $display("TB_FILES GOLDEN_Y=%s", GOLDEN_Y_FILE);
+        end else begin
+            $display("TB_FILES GOLDEN_Y=<disabled>");
         end
 
         require_file(X_STREAM_FILE);

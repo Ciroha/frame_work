@@ -312,7 +312,7 @@
         <Option Name="xsim.simulate.log_all_signals" Val="true"/>
         <Generic Name="PARALLELISM" Val="16"/>
         <Generic Name="MODE_ID52" Val="1"/>
-        <Generic Name="SYMMETRIC_UPPER_ONLY" Val="0"/>
+        <Generic Name="SYMMETRIC_UPPER_ONLY" Val="1"/>
         <Generic Name="SIM_USE_MUL_IP" Val="1"/>
         <Generic Name="SIM_USE_ADD_IP" Val="1"/>
         <Generic Name="VECTOR_DEPTH" Val="256"/>
