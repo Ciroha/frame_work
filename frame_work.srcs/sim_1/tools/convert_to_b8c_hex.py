@@ -5,6 +5,7 @@ Convert matrix input to testbench readmemh streams for tb_b8c_top_ram.
 Supported input modes:
 1) Matrix Market (.mtx): --mtx <path>
 2) Pre-packed B8C JSON : --b8c-json <path>
+3) Clustered matrix JSON: --clustered-json <path>
 
 Outputs:
 - x_stream.hex        (AXI 512b beats for X load phase)
@@ -43,6 +44,10 @@ FP64_HEX_CHARS = 16
 AXI_FP64_PER_BEAT = AXI_HEX_CHARS // FP64_HEX_CHARS  # 8 x FP64 per 512-bit beat
 ID_HEX_CHARS = 2
 ID_PER_AXI_BEAT = AXI_HEX_CHARS // ID_HEX_CHARS  # 64 x 8-bit IDs per 512-bit beat
+
+
+class UniqueValueOverflowError(ValueError):
+    pass
 
 
 def calc_val_batch(lanes: int) -> int:
@@ -113,6 +118,64 @@ def flatten_beat_values_lane0_first(beats: Sequence[Beat]) -> List[float]:
     return flat
 
 
+def build_value_dictionary_from_values(
+    source_values: Sequence[float],
+    out_dir: str,
+    value_stream_values: Optional[Sequence[float]] = None,
+    lut_filename: str = "lut.hex",
+    mapped_stream_filename: str = "value_id_stream.hex",
+) -> Tuple[np.ndarray, Dict[int, int], int]:
+    data_f64 = np.asarray(source_values, dtype=np.float64)
+    if np.isnan(data_f64).any():
+        raise ValueError("matrix values contain NaN, which is not allowed")
+
+    data_u64 = data_f64.view(np.uint64)
+    unique_u64 = np.unique(data_u64)
+
+    extra_u64 = np.array([], dtype=np.uint64)
+    if value_stream_values is not None:
+        stream_arr = np.asarray(value_stream_values, dtype=np.float64)
+        if np.isnan(stream_arr).any():
+            raise ValueError("value stream contains NaN, which is not allowed")
+        stream_u64 = stream_arr.view(np.uint64)
+        miss_mask = ~np.isin(stream_u64, unique_u64, assume_unique=False)
+        if miss_mask.any():
+            extra_u64 = np.unique(stream_u64[miss_mask])
+
+    final_unique = unique_u64
+    if extra_u64.size > 0:
+        final_unique = np.concatenate([unique_u64, extra_u64]).astype(np.uint64, copy=False)
+
+    zero_bits = np.uint64(f64_to_u64(0.0))
+    if value_stream_values is not None and not np.isin(zero_bits, final_unique, assume_unique=False):
+        final_unique = np.concatenate([final_unique, np.array([zero_bits], dtype=np.uint64)])
+
+    if final_unique.size > 256:
+        msg = "独特值过多，超出 8-bit ID 容量"
+        print(f"Warning: {msg} (count={final_unique.size})")
+        warnings.warn(msg, RuntimeWarning)
+        raise UniqueValueOverflowError(f"{msg}: {final_unique.size}")
+
+    lut_u64 = np.zeros(256, dtype=np.uint64)
+    lut_u64[: final_unique.size] = final_unique
+    lut_lines = [f"{int(v):016X}" for v in lut_u64]
+    write_lines(os.path.join(out_dir, lut_filename), lut_lines)
+
+    value_to_id: Dict[int, int] = {int(bits): idx for idx, bits in enumerate(final_unique.tolist())}
+    zero_id = value_to_id[int(zero_bits)]
+
+    if value_stream_values is not None:
+        stream_u64 = np.asarray(value_stream_values, dtype=np.float64).view(np.uint64)
+        stream_ids = np.fromiter((value_to_id[int(bits)] for bits in stream_u64.tolist()), dtype=np.uint8)
+        mapped_lines = build_value_id_stream_hex(stream_ids.tolist(), pad_id=zero_id)
+    else:
+        source_ids = np.fromiter((value_to_id[int(bits)] for bits in data_u64.tolist()), dtype=np.uint8)
+        mapped_lines = build_value_id_stream_hex(source_ids.tolist(), pad_id=zero_id)
+    write_lines(os.path.join(out_dir, mapped_stream_filename), mapped_lines)
+
+    return lut_u64, value_to_id, int(data_u64.size)
+
+
 def build_value_dictionary_and_map(
     mtx_path: str,
     out_dir: str,
@@ -142,56 +205,16 @@ def build_value_dictionary_and_map(
     mm = spio.mmread(mtx_path)
     csr_mat = mm.tocsr() if not sp_sparse.isspmatrix_csr(mm) else mm.copy()
 
-    data_f64 = np.asarray(csr_mat.data, dtype=np.float64)
-    if np.isnan(data_f64).any():
-        raise ValueError("matrix contains NaN, which is not allowed")
+    lut_u64, value_to_id, _ = build_value_dictionary_from_values(
+        csr_mat.data,
+        out_dir,
+        value_stream_values=value_stream_values,
+        lut_filename=lut_filename,
+        mapped_stream_filename=mapped_stream_filename,
+    )
 
-    data_u64 = data_f64.view(np.uint64)
-    unique_u64, inverse = np.unique(data_u64, return_inverse=True)  # sorted bit-pattern IDs from matrix data
-
-    # If stream-order values are provided, allow adding structural values not present in csr.data
-    # (e.g., padding zeros introduced during beat packing).
-    extra_u64 = np.array([], dtype=np.uint64)
-    if value_stream_values is not None:
-        stream_arr = np.asarray(value_stream_values, dtype=np.float64)
-        if np.isnan(stream_arr).any():
-            raise ValueError("value stream contains NaN, which is not allowed")
-        stream_u64 = stream_arr.view(np.uint64)
-        miss_mask = ~np.isin(stream_u64, unique_u64, assume_unique=False)
-        if miss_mask.any():
-            extra_u64 = np.unique(stream_u64[miss_mask])
-
-    final_unique = unique_u64
-    if extra_u64.size > 0:
-        final_unique = np.concatenate([unique_u64, extra_u64]).astype(np.uint64, copy=False)
-
-    zero_bits = np.uint64(f64_to_u64(0.0))
-    if value_stream_values is not None and not np.isin(zero_bits, final_unique, assume_unique=False):
-        final_unique = np.concatenate([final_unique, np.array([zero_bits], dtype=np.uint64)])
-
-    if final_unique.size > 256:
-        msg = "独特值过多，超出 8-bit ID 容量"
-        print(f"Warning: {msg} (count={final_unique.size})")
-        warnings.warn(msg, RuntimeWarning)
-        raise ValueError(f"{msg}: {final_unique.size}")
-
-    lut_u64 = np.zeros(256, dtype=np.uint64)
-    lut_u64[: final_unique.size] = final_unique
-    lut_lines = [f"{int(v):016X}" for v in lut_u64]
-    write_lines(os.path.join(out_dir, lut_filename), lut_lines)
-
-    value_to_id: Dict[int, int] = {int(bits): idx for idx, bits in enumerate(final_unique.tolist())}
-    zero_id = value_to_id[int(zero_bits)]
-
+    data_u64 = np.asarray(csr_mat.data, dtype=np.float64).view(np.uint64)
     mapped_ids = np.fromiter((value_to_id[int(bits)] for bits in data_u64.tolist()), dtype=np.uint8)
-
-    if value_stream_values is not None:
-        stream_u64 = np.asarray(value_stream_values, dtype=np.float64).view(np.uint64)
-        stream_ids = np.fromiter((value_to_id[int(bits)] for bits in stream_u64.tolist()), dtype=np.uint8)
-        mapped_lines = build_value_id_stream_hex(stream_ids.tolist(), pad_id=zero_id)
-    else:
-        mapped_lines = build_value_id_stream_hex(mapped_ids.tolist())
-    write_lines(os.path.join(out_dir, mapped_stream_filename), mapped_lines)
 
     mapped_csr = csr_mat.copy()
     mapped_csr.data = mapped_ids
@@ -290,6 +313,57 @@ def load_b8c_json(path: str) -> Tuple[int, int, List[Beat]]:
             max_col = max(max_col, b.col_base + (LANES - 1))
         cols = max_col + 1 if beats else 0
     return rows, cols, beats
+
+
+def load_clustered_json(path: str) -> Tuple[int, int, List[Tuple[int, int, float]], dict]:
+    with open(path, "r", encoding="utf-8") as f:
+        obj = json.load(f)
+
+    schema = obj.get("schema")
+    if schema not in {"mode_id52_clustered_matrix_v1", "mode_id52_clustered_matrix_v2"}:
+        raise ValueError("clustered-json schema must be mode_id52_clustered_matrix_v1 or mode_id52_clustered_matrix_v2")
+    if "entries" not in obj or not isinstance(obj["entries"], list):
+        raise ValueError("clustered-json must contain list key 'entries'")
+
+    rows = int(obj.get("rows", 0))
+    cols = int(obj.get("cols", 0))
+    if rows <= 0 or cols <= 0:
+        raise ValueError("clustered-json must contain positive rows/cols")
+
+    entries: List[Tuple[int, int, float]] = []
+    for i, item in enumerate(obj["entries"]):
+        try:
+            row = int(item["row"])
+            col = int(item["col"])
+            value = float(item["value"])
+        except Exception as ex:  # noqa: BLE001
+            raise ValueError(f"invalid clustered entry #{i}: {ex}") from ex
+        if row < 0 or row >= rows or col < 0 or col >= cols:
+            raise ValueError(f"clustered entry #{i} out of bounds: row={row}, col={col}, shape=({rows}, {cols})")
+        entries.append((row, col, value))
+
+    audit = {
+        "input_kind": "clustered-json",
+        "schema": obj.get("schema"),
+        "matrix_name": obj.get("matrix_name"),
+        "source_mtx": obj.get("source_mtx"),
+        "source_sha256": obj.get("source_sha256"),
+        "rows": rows,
+        "cols": cols,
+        "nnz": len(entries),
+        "n_clusters": int(obj.get("n_clusters", 0)) if obj.get("n_clusters") is not None else None,
+        "representatives": obj.get("representatives", []),
+        "representative_count": len(obj.get("representatives", [])) if isinstance(obj.get("representatives"), list) else 0,
+    }
+    return rows, cols, entries, audit
+
+
+def write_audit_metadata(out_dir: str, metadata: dict) -> None:
+    path = os.path.join(out_dir, "artifact_audit.json")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        json.dump(metadata, f, indent=2, sort_keys=True)
+        f.write("\n")
 
 
 def pack_mtx_to_beats(entries: Sequence[Tuple[int, int, float]]) -> List[Beat]:
@@ -505,6 +579,7 @@ def main() -> None:
     src = ap.add_mutually_exclusive_group(required=True)
     src.add_argument("--mtx", help="input Matrix Market (.mtx)")
     src.add_argument("--b8c-json", help="input B8C JSON file")
+    src.add_argument("--clustered-json", help="input clustered matrix JSON file")
 
     ap.add_argument("--out-dir", required=True, help="output directory for .hex files")
     ap.add_argument("--lanes", type=int, choices=(8, 16), default=8, help="compute lanes (tb PARALLELISM)")
@@ -529,29 +604,92 @@ def main() -> None:
     if args.vector_depth <= 0:
         raise ValueError("--vector-depth must be > 0")
 
+    input_kind = "b8c-json"
+    audit_metadata = {
+        "lanes": LANES,
+        "value_batch": VAL_BATCH,
+        "vector_depth": args.vector_depth,
+        "symmetric_upper_only": bool(args.symmetric_upper_only),
+    }
+    mapped_nnz: Optional[int] = None
+
     if args.mtx:
+        input_kind = "mtx"
         m_rows, m_cols, entries = parse_mtx(args.mtx, symmetric_upper_only=args.symmetric_upper_only)
         beats = pack_mtx_to_beats(entries)
+        mapped_csr = None
+        lut_u64 = None
+        value_to_id = None
+        compute_id_stream = None
+        audit_metadata.update(
+            {
+                "input_kind": input_kind,
+                "source_path": args.mtx,
+                "rows": m_rows,
+                "cols": m_cols,
+                "nnz": len(entries),
+            }
+        )
+    elif args.clustered_json:
+        input_kind = "clustered-json"
+        if args.symmetric_upper_only:
+            raise ValueError("--symmetric-upper-only is supported only with --mtx input")
+        m_rows, m_cols, entries, clustered_audit = load_clustered_json(args.clustered_json)
+        beats = pack_mtx_to_beats(entries)
+        mapped_csr = None
+        lut_u64 = None
+        value_to_id = None
+        compute_id_stream = None
+        audit_metadata.update(clustered_audit)
+        audit_metadata["source_path"] = args.clustered_json
     else:
         if args.symmetric_upper_only:
             raise ValueError("--symmetric-upper-only is supported only with --mtx input")
         m_rows, m_cols, beats = load_b8c_json(args.b8c_json)
+        mapped_csr = None
+        lut_u64 = None
+        value_to_id = None
+        compute_id_stream = None
+        audit_metadata.update(
+            {
+                "input_kind": input_kind,
+                "source_path": args.b8c_json,
+                "rows": m_rows,
+                "cols": m_cols,
+                "nnz": None,
+            }
+        )
 
     beats = pad_beats_to_blocks(beats)
 
     if args.mtx:
         aligned_stream_vals = flatten_beat_values_lane0_first(beats)
-        mapped_csr, lut_u64, value_to_id = build_value_dictionary_and_map(
-            args.mtx,
+        try:
+            mapped_csr, lut_u64, value_to_id = build_value_dictionary_and_map(
+                args.mtx,
+                args.out_dir,
+                value_stream_values=aligned_stream_vals,
+            )
+            mapped_nnz = int(mapped_csr.data.size)
+            compute_id_stream = build_compute_id_stream(beats, value_to_id)
+        except UniqueValueOverflowError:
+            if LANES != AXI_FP64_PER_BEAT:
+                raise ValueError("--mtx input exceeds 8-bit LUT capacity for MODE_ID52; use clustered-json or lanes=8 exact path")
+            mapped_csr = None
+            lut_u64 = None
+            value_to_id = None
+            compute_id_stream = None
+            mapped_nnz = len(entries)
+            audit_metadata["lut_overflow"] = True
+            audit_metadata["lut_overflow_reason"] = "exact mtx unique values exceed 8-bit LUT capacity"
+    elif args.clustered_json:
+        aligned_stream_vals = flatten_beat_values_lane0_first(beats)
+        lut_u64, value_to_id, mapped_nnz = build_value_dictionary_from_values(
+            [v for _, _, v in entries],
             args.out_dir,
             value_stream_values=aligned_stream_vals,
         )
         compute_id_stream = build_compute_id_stream(beats, value_to_id)
-    else:
-        mapped_csr = None
-        lut_u64 = None
-        value_to_id = None
-        compute_id_stream = None
 
     y_elems = args.y_elems if args.y_elems is not None else m_rows
     if y_elems <= 0:
@@ -589,6 +727,28 @@ def main() -> None:
 
     mat_data_beats = len(beats)
     compute_beats = len(compute_stream)
+    aligned_vals = len(beats) * LANES
+    blocks = len(beats) // VAL_BATCH
+    audit_metadata.update(
+        {
+            "y_elems": y_elems,
+            "x_length": len(x_vec),
+            "y_init_length": len(y_init),
+            "mat_data_beats": mat_data_beats,
+            "aligned_values": aligned_vals,
+            "blocks": blocks,
+            "compute_stream_beats": compute_beats,
+            "compute_stream_generated": bool(compute_stream),
+            "compute_id_stream_generated": compute_id_stream is not None,
+            "golden_y_scalars": len(golden_hex),
+        }
+    )
+    if mapped_nnz is not None:
+        audit_metadata["nnz_mapped"] = mapped_nnz
+    if lut_u64 is not None:
+        audit_metadata["lut_entries"] = int(len(lut_u64))
+    write_audit_metadata(out_dir, audit_metadata)
+
     print("Generated:")
     print(f"  x_stream.hex       beats={len(x_stream)}")
     print(f"  y_stream.hex       beats={len(y_stream)}")
@@ -597,14 +757,14 @@ def main() -> None:
     else:
         print("  compute_stream.hex skipped for lanes != AXI FP64 lanes (MODE_ID52=1 only)")
     print(f"  golden_y.hex       scalars={len(golden_hex)}")
-    if mapped_csr is not None and lut_u64 is not None:
-        aligned_vals = len(beats) * LANES
+    print("  artifact_audit.json written")
+    if lut_u64 is not None:
         id_beats = math.ceil(aligned_vals / ID_PER_AXI_BEAT)
-        blocks = len(beats) // VAL_BATCH
         id_beats_per_block = math.ceil((VAL_BATCH * LANES) / ID_PER_AXI_BEAT)
         compute_id_beats = blocks * (id_beats_per_block + META_BATCH)
         print(f"  lut.hex            entries={len(lut_u64)}")
-        print(f"  value_id_stream.hex beats={id_beats} (aligned_values={aligned_vals}, nnz={mapped_csr.data.size})")
+        nnz_for_print = mapped_nnz if mapped_nnz is not None else 0
+        print(f"  value_id_stream.hex beats={id_beats} (aligned_values={aligned_vals}, nnz={nnz_for_print})")
         print(
             f"  compute_id_stream.hex beats={compute_id_beats} "
             f"(id={blocks*id_beats_per_block}, meta={blocks*META_BATCH})"

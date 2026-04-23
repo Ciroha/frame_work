@@ -709,7 +709,10 @@ module b8c_top #(
     // ========================================================================
     reg [AXI_WIDTH-1:0] y_half_buf;  // 半拍数据缓存(用于LANE_RATIO=2)
     wire y_load_first_half = (LANE_RATIO == 2) && (state == S_LOAD_Y) && in_handshake && (load_cnt[0] == 1'b0);
-    wire y_load_fire = (state == S_LOAD_Y) && in_handshake && ((LANE_RATIO == 1) || (load_cnt[0] == 1'b1));
+    wire y_load_tail_single = (LANE_RATIO == 2) && (state == S_LOAD_Y) && in_handshake &&
+                              (load_cnt[0] == 1'b0) && (load_cnt == Y_AXI_BEATS - 1);
+    wire y_load_fire = (state == S_LOAD_Y) && in_handshake &&
+                       ((LANE_RATIO == 1) || (load_cnt[0] == 1'b1) || y_load_tail_single);
     wire [31:0] y_load_addr_full = (LANE_RATIO == 1) ? load_cnt : (load_cnt >> 1);
     wire [PARALLELISM*DATA_WIDTH-1:0] y_load_data_w;
 
@@ -725,7 +728,8 @@ module b8c_top #(
         if (LANE_RATIO == 1) begin : gen_y_load_direct
             assign y_load_data_w = s_axis_tdata;
         end else begin : gen_y_load_pair
-            assign y_load_data_w = {s_axis_tdata, y_half_buf};
+            assign y_load_data_w = y_load_tail_single ? {{AXI_WIDTH{1'b0}}, s_axis_tdata} :
+                                                     {s_axis_tdata, y_half_buf};
         end
     endgenerate
 
