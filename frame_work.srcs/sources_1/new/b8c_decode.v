@@ -69,6 +69,12 @@ module b8c_decoder #(
     wire [15:0]               parser_row_base;         // 解析后的行基址
     wire [15:0]               parser_col_base;         // 解析后的列基址
     wire [PARALLELISM*16-1:0] parser_row_delta;        // 解析后的行偏移数组
+    reg                       val_stage_valid;         // 数值FIFO读出后对齐到当前拍的有效标志
+    reg [15:0]                meta_row_base_stage;     // 与val_fifo_dout对齐的行基址
+    reg [15:0]                meta_col_base_stage;     // 与val_fifo_dout对齐的列基址
+    reg [PARALLELISM*16-1:0]  meta_row_delta_stage;    // 与val_fifo_dout对齐的行偏移
+    wire                      decoder_consume;
+    wire                      val_issue_read;
 
     // =========================================================
     // 子模块1: 流解复用器 (16数据 : 5元数据)
@@ -130,19 +136,43 @@ module b8c_decoder #(
     // =========================================================
     // 输出逻辑与握手控制
     // =========================================================
-    // 只有当数值FIFO有数据且解析器准备好时,输出才有效
-    assign decoder_valid = (!val_empty) && parser_ready;
+    // simple_sync_fifo 读口有1拍延迟；因此需要把 metadata 先暂存一拍，
+    // 再与下一拍出现的 val_fifo_dout 对齐输出。
+    assign decoder_valid = val_stage_valid;
+    assign decoder_consume = compute_req_next && decoder_valid;
+    assign val_issue_read = parser_ready && !val_empty && (!val_stage_valid || decoder_consume);
 
-    // 当下游请求数据且我们也准备好时,读取FIFO并推进解析器
-    assign val_ren = compute_req_next && decoder_valid;
+    // 当需要装填新的对齐拍时，读取FIFO并推进解析器。
+    assign val_ren = val_issue_read;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            val_stage_valid <= 1'b0;
+            meta_row_base_stage <= 16'd0;
+            meta_col_base_stage <= 16'd0;
+            meta_row_delta_stage <= {PARALLELISM*16{1'b0}};
+        end else begin
+            if (val_issue_read) begin
+                meta_row_base_stage <= parser_row_base;
+                meta_col_base_stage <= parser_col_base;
+                meta_row_delta_stage <= parser_row_delta;
+            end
+
+            if (val_stage_valid && !decoder_consume && !val_issue_read) begin
+                val_stage_valid <= 1'b1;
+            end else begin
+                val_stage_valid <= val_issue_read;
+            end
+        end
+    end
 
     // 输出赋值
-    assign m_vals_data = val_fifo_dout;      // 数值直接从FIFO输出
-    assign m_row_deltas = parser_row_delta;  // 行偏移从解析器输出
-    assign m_row_base   = parser_row_base;   // 行基址从解析器输出
-    assign m_col_base   = parser_col_base;   // 列基址从解析器输出
+    assign m_vals_data = val_fifo_dout;             // 数值来自FIFO读出结果
+    assign m_row_deltas = meta_row_delta_stage;     // 行偏移与数值对齐
+    assign m_row_base   = meta_row_base_stage;      // 行基址与数值对齐
+    assign m_col_base   = meta_col_base_stage;      // 列基址与数值对齐
 
-    // 流水线空闲: 数值FIFO为空表示所有数据已消费完毕
-    assign o_pipeline_idle = val_empty;
+    // 流水线空闲: 无待读数据且无已对齐待消费的数据
+    assign o_pipeline_idle = val_empty && !val_stage_valid;
 
 endmodule
