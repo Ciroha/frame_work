@@ -12,11 +12,15 @@ Default flow:
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import os
 import re
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 @dataclass
@@ -45,6 +49,21 @@ class SimMetrics:
     dec_meta_full_cycles: int | None
     dec_pair_wait_cycles: int | None
     dec_consume_cycles: int | None
+    dec_decoder_valid_cycles: int | None
+    dec_compute_req_cycles: int | None
+    dec_compute_backpressure_cycles: int | None
+    dec_no_decoder_valid_cycles: int | None
+    dec_both_ready_cycles: int | None
+    dec_both_empty_cycles: int | None
+    dec_id_only_wait_cycles: int | None
+    dec_meta_only_wait_cycles: int | None
+    dec_id_q_occupancy_sum: int | None
+    dec_meta_q_occupancy_sum: int | None
+    dec_id_q_occupancy_max: int | None
+    dec_meta_q_occupancy_max: int | None
+    y_abs_tol: float | None
+    auto_check_valid_scalars: int | None
+    auto_check_padding_scalars: int | None
 
 
 def run_cmd(cmd: list[str], cwd: Path, env: dict[str, str]) -> None:
@@ -81,8 +100,15 @@ def parse_log(mode: int, sim_log: Path) -> SimMetrics:
         r"DEC_STATS\s+id_empty=(\d+)\s+id_full=(\d+)\s+meta_empty=(\d+)\s+meta_full=(\d+)\s+pair_wait=(\d+)\s+consume=(\d+)",
         txt,
     )
-    pass_m = re.search(r"AUTO-CHECK PASSED", txt)
+    dec_detail_m = re.search(
+        r"DEC_DETAIL_STATS\s+decoder_valid=(\d+)\s+compute_req=(\d+)\s+compute_backpressure=(\d+)\s+no_decoder_valid=(\d+)\s+both_ready=(\d+)\s+both_empty=(\d+)\s+id_only_wait=(\d+)\s+meta_only_wait=(\d+)\s+id_q_sum=(\d+)\s+meta_q_sum=(\d+)\s+id_q_max=(\d+)\s+meta_q_max=(\d+)",
+        txt,
+    )
+    pass_m = re.search(r"AUTO-CHECK PASSED:\s+(\d+)\s+valid scalars \+\s+(\d+)\s+padding scalars", txt)
+    if not pass_m:
+        pass_m = re.search(r"AUTO-CHECK PASSED", txt)
     fail_m = re.search(r"AUTO-CHECK FAILED with (\d+) mismatches", txt)
+    y_abs_tol_m = re.search(r"Y_ABS_TOL=([0-9.eE+-]+)", txt)
 
     compute_start_ns = (int(compute_start_m.group(1)) / 1000.0) if compute_start_m else None
     compute_beats = int(compute_beats_m.group(2) if compute_start_m else compute_beats_m.group(1)) if compute_beats_m else None
@@ -105,6 +131,24 @@ def parse_log(mode: int, sim_log: Path) -> SimMetrics:
     dec_meta_full_cycles = int(dec_stats_m.group(4)) if dec_stats_m else None
     dec_pair_wait_cycles = int(dec_stats_m.group(5)) if dec_stats_m else None
     dec_consume_cycles = int(dec_stats_m.group(6)) if dec_stats_m else None
+    dec_decoder_valid_cycles = int(dec_detail_m.group(1)) if dec_detail_m else None
+    dec_compute_req_cycles = int(dec_detail_m.group(2)) if dec_detail_m else None
+    dec_compute_backpressure_cycles = int(dec_detail_m.group(3)) if dec_detail_m else None
+    dec_no_decoder_valid_cycles = int(dec_detail_m.group(4)) if dec_detail_m else None
+    dec_both_ready_cycles = int(dec_detail_m.group(5)) if dec_detail_m else None
+    dec_both_empty_cycles = int(dec_detail_m.group(6)) if dec_detail_m else None
+    dec_id_only_wait_cycles = int(dec_detail_m.group(7)) if dec_detail_m else None
+    dec_meta_only_wait_cycles = int(dec_detail_m.group(8)) if dec_detail_m else None
+    dec_id_q_occupancy_sum = int(dec_detail_m.group(9)) if dec_detail_m else None
+    dec_meta_q_occupancy_sum = int(dec_detail_m.group(10)) if dec_detail_m else None
+    dec_id_q_occupancy_max = int(dec_detail_m.group(11)) if dec_detail_m else None
+    dec_meta_q_occupancy_max = int(dec_detail_m.group(12)) if dec_detail_m else None
+    y_abs_tol = float(y_abs_tol_m.group(1)) if y_abs_tol_m else None
+    auto_check_valid_scalars = None
+    auto_check_padding_scalars = None
+    if pass_m and pass_m.lastindex and pass_m.lastindex >= 2:
+        auto_check_valid_scalars = int(pass_m.group(1))
+        auto_check_padding_scalars = int(pass_m.group(2))
 
     return SimMetrics(
         mode=mode,
@@ -131,6 +175,21 @@ def parse_log(mode: int, sim_log: Path) -> SimMetrics:
         dec_meta_full_cycles=dec_meta_full_cycles,
         dec_pair_wait_cycles=dec_pair_wait_cycles,
         dec_consume_cycles=dec_consume_cycles,
+        dec_decoder_valid_cycles=dec_decoder_valid_cycles,
+        dec_compute_req_cycles=dec_compute_req_cycles,
+        dec_compute_backpressure_cycles=dec_compute_backpressure_cycles,
+        dec_no_decoder_valid_cycles=dec_no_decoder_valid_cycles,
+        dec_both_ready_cycles=dec_both_ready_cycles,
+        dec_both_empty_cycles=dec_both_empty_cycles,
+        dec_id_only_wait_cycles=dec_id_only_wait_cycles,
+        dec_meta_only_wait_cycles=dec_meta_only_wait_cycles,
+        dec_id_q_occupancy_sum=dec_id_q_occupancy_sum,
+        dec_meta_q_occupancy_sum=dec_meta_q_occupancy_sum,
+        dec_id_q_occupancy_max=dec_id_q_occupancy_max,
+        dec_meta_q_occupancy_max=dec_meta_q_occupancy_max,
+        y_abs_tol=y_abs_tol,
+        auto_check_valid_scalars=auto_check_valid_scalars,
+        auto_check_padding_scalars=auto_check_padding_scalars,
     )
 
 
@@ -140,6 +199,135 @@ def fmt(v: float | int | None, digits: int = 3) -> str:
     if isinstance(v, int):
         return str(v)
     return f"{v:.{digits}f}"
+
+
+def parse_int_list(text: str) -> list[int]:
+    return [int(part) for part in text.split(",") if part.strip()]
+
+
+def load_artifact_audit(data_dir: str | None) -> dict[str, Any]:
+    if not data_dir:
+        return {}
+    audit_path = Path(data_dir) / "artifact_audit.json"
+    if not audit_path.exists():
+        return {}
+    return json.loads(audit_path.read_text(encoding="utf-8"))
+
+
+def safe_div(num: float | int | None, den: float | int | None) -> float | None:
+    if num is None or den in (None, 0):
+        return None
+    return float(num) / float(den)
+
+
+def infer_strategy(audit: dict[str, Any], mode: int) -> str:
+    if mode == 0:
+        return "B8C-raw-stream"
+    input_kind = str(audit.get("input_kind") or "")
+    if "cluster" in input_kind:
+        return "B8C-clustered-ID52"
+    return "B8C-exact-ID52-MODE1"
+
+
+def metric_row(prefix: str, parallelism: int, decouple: int, id_depth: int, meta_depth: int, y_queue_depth: int | None, y_limited_bypass_window: int | None, m: SimMetrics, data_dir: str | None = None, run_id: str | None = None, comparison_domain: str = "rtl_diagnostic", backend_pressure_domain: str = "backend_enabled", clock_period_ns: float = 10.0) -> dict[str, Any]:
+    audit = load_artifact_audit(data_dir)
+    active_tokens = audit.get("nnz") or m.auto_check_valid_scalars
+    blocks = audit.get("blocks")
+    meta_beats = blocks * 5 if blocks is not None else None
+    stream_beats = m.compute_beats
+    if m.mode == 1 and m.compute_beats is not None and meta_beats is not None:
+        id_beats = max(0, m.compute_beats - meta_beats)
+    else:
+        id_beats = 0
+    compute_active_cycles = m.dec_compute_req_cycles or m.dec_consume_cycles or m.ready_high_cycles
+    total_compute_cycles = safe_div(m.total_compute_to_finish_ns, clock_period_ns)
+    candidate_min_cycles = None
+    if stream_beats is not None and active_tokens is not None:
+        token_term = active_tokens
+        candidate_min_cycles = max(float(stream_beats), float(token_term))
+    lost_cycles = None
+    if total_compute_cycles is not None and candidate_min_cycles is not None:
+        lost_cycles = float(total_compute_cycles) - float(candidate_min_cycles)
+    stall_cycles = max(
+        value for value in (
+            m.dec_compute_backpressure_cycles,
+            m.dec_no_decoder_valid_cycles,
+            m.dec_pair_wait_cycles,
+            m.ready_low_cycles,
+            0,
+        ) if value is not None
+    )
+    dominant_stall_share = safe_div(stall_cycles, lost_cycles) if lost_cycles and lost_cycles > 0 else None
+    return {
+        "matrix": audit.get("matrix_name"),
+        "artifact_dir": str(Path(data_dir).resolve()) if data_dir else None,
+        "mode": m.mode,
+        "strategy": infer_strategy(audit, m.mode),
+        "comparison_domain": comparison_domain,
+        "backend_pressure_domain": backend_pressure_domain,
+        "parallelism": parallelism,
+        "run_id": run_id or prefix,
+        "prefix": prefix,
+        "decouple_id_meta": decouple,
+        "id_q_depth": id_depth,
+        "meta_q_depth": meta_depth,
+        "y_queue_depth": y_queue_depth,
+        "y_limited_bypass_window": y_limited_bypass_window,
+        "auto_check_passed": m.passed,
+        "passed": m.passed,
+        "failed": m.failed,
+        "mismatch_count": m.mismatches if m.mismatches is not None else (0 if m.passed else None),
+        "mismatches": m.mismatches,
+        "y_abs_tol": m.y_abs_tol,
+        "auto_check_valid_scalars": m.auto_check_valid_scalars,
+        "auto_check_padding_scalars": m.auto_check_padding_scalars,
+        "active_tokens": active_tokens,
+        "blocks": blocks,
+        "mat_data_beats": audit.get("mat_data_beats"),
+        "value_batch": audit.get("value_batch"),
+        "id_beats": id_beats,
+        "meta_beats": meta_beats,
+        "stream_beats": stream_beats,
+        "candidate_min_cycles": candidate_min_cycles,
+        "lost_cycles": lost_cycles,
+        "dominant_stall_share": dominant_stall_share,
+        "effective_tokens_per_compute_active_cycle": safe_div(active_tokens, compute_active_cycles),
+        "effective_tokens_per_total_compute_cycle": safe_div(active_tokens, total_compute_cycles),
+        "residual_pct": safe_div(lost_cycles, total_compute_cycles),
+        "metadata_v2_rtl_allowed": False,
+        "compute_beats": m.compute_beats,
+        "compute_start_ns": m.compute_start_ns,
+        "all_data_ns": m.all_data_ns,
+        "writeback_start_ns": m.writeback_start_ns,
+        "finish_ns": m.finish_ns,
+        "feed_ns": m.feed_ns,
+        "drain_ns": m.drain_ns,
+        "store_check_ns": m.store_check_ns,
+        "total_compute_to_finish_ns": m.total_compute_to_finish_ns,
+        "ready_total_cycles": m.ready_total_cycles,
+        "ready_high_cycles": m.ready_high_cycles,
+        "ready_low_cycles": m.ready_low_cycles,
+        "ready_low_ratio": m.ready_low_ratio,
+        "dec_id_empty_cycles": m.dec_id_empty_cycles,
+        "dec_id_full_cycles": m.dec_id_full_cycles,
+        "dec_meta_empty_cycles": m.dec_meta_empty_cycles,
+        "dec_meta_full_cycles": m.dec_meta_full_cycles,
+        "dec_pair_wait_cycles": m.dec_pair_wait_cycles,
+        "dec_consume_cycles": m.dec_consume_cycles,
+        "dec_decoder_valid_cycles": m.dec_decoder_valid_cycles,
+        "dec_compute_req_cycles": m.dec_compute_req_cycles,
+        "dec_compute_backpressure_cycles": m.dec_compute_backpressure_cycles,
+        "dec_no_decoder_valid_cycles": m.dec_no_decoder_valid_cycles,
+        "dec_both_ready_cycles": m.dec_both_ready_cycles,
+        "dec_both_empty_cycles": m.dec_both_empty_cycles,
+        "dec_id_only_wait_cycles": m.dec_id_only_wait_cycles,
+        "dec_meta_only_wait_cycles": m.dec_meta_only_wait_cycles,
+        "dec_id_q_occupancy_sum": m.dec_id_q_occupancy_sum,
+        "dec_meta_q_occupancy_sum": m.dec_meta_q_occupancy_sum,
+        "dec_id_q_occupancy_max": m.dec_id_q_occupancy_max,
+        "dec_meta_q_occupancy_max": m.dec_meta_q_occupancy_max,
+        "sim_log": str(m.sim_log),
+    }
 
 
 def main() -> None:
@@ -188,7 +376,7 @@ def main() -> None:
         type=int,
         choices=(8, 16),
         default=8,
-        help="set PARALLELISM in testbench before runs",
+        help="set PARALLELISM in testbench before runs; --id52-sweep requires 16 for clustered LUT sweeps",
     )
     ap.add_argument(
         "--symmetric-upper-only",
@@ -221,11 +409,91 @@ def main() -> None:
         help="optional data directory containing x_stream.hex/y_stream.hex/compute_id_stream.hex/lut.hex/golden_y.hex",
     )
     ap.add_argument(
+        "--y-queue-depth",
+        type=int,
+        default=None,
+        help="optional Y_QUEUE_DEPTH override in testbench",
+    )
+    ap.add_argument(
+        "--y-limited-bypass-window",
+        type=int,
+        default=None,
+        help="optional Y_LIMITED_BYPASS_WINDOW override in testbench",
+    )
+    ap.add_argument(
+        "--id52-sweep",
+        action="store_true",
+        help="run an ID52-only sweep over decouple/depth options and write a CSV",
+    )
+    ap.add_argument(
+        "--mode0-only",
+        action="store_true",
+        help="run MODE_ID52=0 only",
+    )
+    ap.add_argument(
+        "--mode1-only",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    ap.add_argument(
+        "--sweep-decouple-id-meta",
+        default="0,1",
+        help="comma-separated DECOUPLE_ID_META values for --id52-sweep",
+    )
+    ap.add_argument(
+        "--sweep-id-q-depths",
+        default="8,16",
+        help="comma-separated ID_Q_DEPTH values for --id52-sweep",
+    )
+    ap.add_argument(
+        "--sweep-meta-q-depths",
+        default="8,16",
+        help="comma-separated META_Q_DEPTH values for --id52-sweep",
+    )
+    ap.add_argument(
+        "--sweep-output",
+        default=None,
+        help="optional CSV path for --id52-sweep results",
+    )
+    ap.add_argument(
         "--reuse-logs",
         action="store_true",
         help="skip run; only parse existing simulate_<prefix>_m0.log and _m1.log",
     )
+    ap.add_argument(
+        "--run-id",
+        default=None,
+        help="optional run identifier recorded in metrics artifacts",
+    )
+    ap.add_argument(
+        "--comparison-domain",
+        default="rtl_diagnostic",
+        help="domain label for metrics artifacts; use rtl_measured_no_backend only with explicit backend-disabled evidence",
+    )
+    ap.add_argument(
+        "--backend-pressure-domain",
+        default="backend_enabled",
+        help="backend pressure label for metrics artifacts",
+    )
+    ap.add_argument(
+        "--metrics-json",
+        default=None,
+        help="optional JSON path for machine-readable timing/bottleneck rows",
+    )
+    ap.add_argument(
+        "--metrics-csv",
+        default=None,
+        help="optional CSV path for machine-readable timing/bottleneck rows",
+    )
+    ap.add_argument(
+        "--clock-period-ns",
+        type=float,
+        default=10.0,
+        help="clock period used to convert ns durations into cycle estimates for metrics artifacts",
+    )
     args = ap.parse_args()
+    if args.mode0_only and args.mode1_only:
+        ap.error("--mode0-only and --mode1-only cannot be used together")
 
     xsim_dir = Path(args.xsim_dir).resolve()
     vivado_bin = Path(args.vivado_bin).resolve()
@@ -246,7 +514,75 @@ def main() -> None:
     env = os.environ.copy()
     env["PATH"] = str(vivado_bin) + os.pathsep + env.get("PATH", "")
 
-    run_modes = (0, 1) if args.parallelism == 8 else (1,)
+    if args.id52_sweep:
+        if args.parallelism != 16:
+            raise ValueError("--id52-sweep requires --parallelism 16 for the current clustered LUT path")
+        rows: list[dict[str, int | float | str | bool | None]] = []
+        original_prefix = args.prefix
+        original_reuse_logs = args.reuse_logs
+        for decouple in parse_int_list(args.sweep_decouple_id_meta):
+            if decouple not in (0, 1):
+                raise ValueError("sweep decouple values must be 0 or 1")
+            for id_depth in parse_int_list(args.sweep_id_q_depths):
+                for meta_depth in parse_int_list(args.sweep_meta_q_depths):
+                    args.decouple_id_meta = decouple
+                    args.id_q_depth = id_depth
+                    args.meta_q_depth = meta_depth
+                    args.prefix = f"{original_prefix}_d{decouple}_iq{id_depth}_mq{meta_depth}"
+                    args.reuse_logs = original_reuse_logs
+                    cmd = [sys.executable, str(Path(__file__).resolve())]
+                    for key in ("xsim_dir", "vivado_bin", "tb_file", "prefix", "parallelism", "symmetric_upper_only", "decouple_id_meta", "id_q_depth", "meta_q_depth"):
+                        cmd.extend(["--" + key.replace("_", "-"), str(getattr(args, key))])
+                    if args.vector_depth is not None:
+                        cmd.extend(["--vector-depth", str(args.vector_depth)])
+                    if args.y_elems is not None:
+                        cmd.extend(["--y-elems", str(args.y_elems)])
+                    if args.mat_data_beats is not None:
+                        cmd.extend(["--mat-data-beats", str(args.mat_data_beats)])
+                    if args.data_dir is not None:
+                        cmd.extend(["--data-dir", str(args.data_dir)])
+                    if args.y_queue_depth is not None:
+                        cmd.extend(["--y-queue-depth", str(args.y_queue_depth)])
+                    if args.y_limited_bypass_window is not None:
+                        cmd.extend(["--y-limited-bypass-window", str(args.y_limited_bypass_window)])
+                    cmd.append("--mode1-only")
+                    if args.reuse_logs:
+                        cmd.append("--reuse-logs")
+                    run_cmd(cmd, cwd=Path.cwd(), env=env)
+                    run_modes = (1,)
+                    metrics_by_mode = {
+                        mode: parse_log(mode, xsim_dir / f"simulate_{args.prefix}_m{mode}.log")
+                        for mode in run_modes
+                    }
+                    rows.append(metric_row(args.prefix, args.parallelism, decouple, id_depth, meta_depth, args.y_queue_depth, args.y_limited_bypass_window, metrics_by_mode[1], args.data_dir, args.run_id, args.comparison_domain, args.backend_pressure_domain, args.clock_period_ns))
+        output = Path(args.sweep_output) if args.sweep_output else xsim_dir / f"{original_prefix}_id52_sweep.csv"
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with output.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [])
+            writer.writeheader()
+            writer.writerows(rows)
+        print(f"\nWrote ID52 sweep CSV: {output}")
+        if args.metrics_json:
+            metrics_json = Path(args.metrics_json)
+            metrics_json.parent.mkdir(parents=True, exist_ok=True)
+            metrics_json.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+            print(f"Wrote metrics JSON: {metrics_json}")
+        if args.metrics_csv:
+            metrics_csv = Path(args.metrics_csv)
+            metrics_csv.parent.mkdir(parents=True, exist_ok=True)
+            with metrics_csv.open("w", encoding="utf-8", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()) if rows else [])
+                writer.writeheader()
+                writer.writerows(rows)
+            print(f"Wrote metrics CSV: {metrics_csv}")
+        return
+
+    if args.mode0_only:
+        run_modes = (0,)
+    elif args.mode1_only:
+        run_modes = (1,)
+    else:
+        run_modes = (0, 1) if args.parallelism == 8 else (1,)
 
     if not args.reuse_logs:
         original_tb = tb_file.read_text(encoding="utf-8")
@@ -264,6 +600,10 @@ def main() -> None:
                     set_tb_param(tb_file, "Y_ELEMS", str(args.y_elems))
                 if args.mat_data_beats is not None:
                     set_tb_param(tb_file, "MAT_DATA_BEATS", str(args.mat_data_beats))
+                if args.y_queue_depth is not None:
+                    set_tb_param(tb_file, "Y_QUEUE_DEPTH", str(args.y_queue_depth))
+                if args.y_limited_bypass_window is not None:
+                    set_tb_param(tb_file, "Y_LIMITED_BYPASS_WINDOW", str(args.y_limited_bypass_window))
                 if args.data_dir is not None:
                     data_dir = Path(args.data_dir).resolve().as_posix()
                     set_tb_param(tb_file, "X_STREAM_FILE", f"\"{data_dir}/x_stream.hex\"")
@@ -363,6 +703,24 @@ def main() -> None:
             return None
         return a / b
 
+    metric_rows = [
+        metric_row(args.prefix, args.parallelism, args.decouple_id_meta, args.id_q_depth, args.meta_q_depth, args.y_queue_depth, args.y_limited_bypass_window, metrics_by_mode[mode], args.data_dir, args.run_id, args.comparison_domain, args.backend_pressure_domain, args.clock_period_ns)
+        for mode in run_modes
+    ]
+    if args.metrics_json:
+        metrics_json = Path(args.metrics_json)
+        metrics_json.parent.mkdir(parents=True, exist_ok=True)
+        metrics_json.write_text(json.dumps(metric_rows, indent=2), encoding="utf-8")
+        print(f"Wrote metrics JSON: {metrics_json}")
+    if args.metrics_csv:
+        metrics_csv = Path(args.metrics_csv)
+        metrics_csv.parent.mkdir(parents=True, exist_ok=True)
+        with metrics_csv.open("w", encoding="utf-8", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=list(metric_rows[0].keys()) if metric_rows else [])
+            writer.writeheader()
+            writer.writerows(metric_rows)
+        print(f"Wrote metrics CSV: {metrics_csv}")
+
     print("\n=== MODE Compare ===")
     print(
         f"Config: PARALLELISM={args.parallelism}, "
@@ -405,12 +763,22 @@ def main() -> None:
         print(f"| dec_meta_full_cycles | {fmt(m0.dec_meta_full_cycles)} | {fmt(m1.dec_meta_full_cycles)} | N/A |")
         print(f"| dec_pair_wait_cycles | {fmt(m0.dec_pair_wait_cycles)} | {fmt(m1.dec_pair_wait_cycles)} | N/A |")
         print(f"| dec_consume_cycles | {fmt(m0.dec_consume_cycles)} | {fmt(m1.dec_consume_cycles)} | N/A |")
+        print(f"| dec_decoder_valid_cycles | {fmt(m0.dec_decoder_valid_cycles)} | {fmt(m1.dec_decoder_valid_cycles)} | N/A |")
+        print(f"| dec_compute_req_cycles | {fmt(m0.dec_compute_req_cycles)} | {fmt(m1.dec_compute_req_cycles)} | N/A |")
+        print(f"| dec_compute_backpressure_cycles | {fmt(m0.dec_compute_backpressure_cycles)} | {fmt(m1.dec_compute_backpressure_cycles)} | N/A |")
+        print(f"| dec_no_decoder_valid_cycles | {fmt(m0.dec_no_decoder_valid_cycles)} | {fmt(m1.dec_no_decoder_valid_cycles)} | N/A |")
+        print(f"| dec_both_ready_cycles | {fmt(m0.dec_both_ready_cycles)} | {fmt(m1.dec_both_ready_cycles)} | N/A |")
+        print(f"| dec_both_empty_cycles | {fmt(m0.dec_both_empty_cycles)} | {fmt(m1.dec_both_empty_cycles)} | N/A |")
+        print(f"| dec_id_only_wait_cycles | {fmt(m0.dec_id_only_wait_cycles)} | {fmt(m1.dec_id_only_wait_cycles)} | N/A |")
+        print(f"| dec_meta_only_wait_cycles | {fmt(m0.dec_meta_only_wait_cycles)} | {fmt(m1.dec_meta_only_wait_cycles)} | N/A |")
+        print(f"| dec_id_q_occupancy_max | {fmt(m0.dec_id_q_occupancy_max)} | {fmt(m1.dec_id_q_occupancy_max)} | N/A |")
+        print(f"| dec_meta_q_occupancy_max | {fmt(m0.dec_meta_q_occupancy_max)} | {fmt(m1.dec_meta_q_occupancy_max)} | N/A |")
         print("\nLogs:")
         print(f"- MODE0: {m0.sim_log}")
         print(f"- MODE1: {m1.sim_log}")
-    else:
+    elif run_modes == (1,):
         m1 = metrics_by_mode[1]
-        print("PARALLELISM=16 flow runs MODE1 only (legacy MODE0 disabled in RTL).")
+        print("MODE1-only flow.")
         print("| Metric | MODE1 |")
         print("|---|---:|")
         print(f"| pass | {m1.passed} |")
@@ -423,8 +791,33 @@ def main() -> None:
         print(f"| ready_low_ratio | {fmt(m1.ready_low_ratio)} |")
         print(f"| dec_pair_wait_cycles | {fmt(m1.dec_pair_wait_cycles)} |")
         print(f"| dec_consume_cycles | {fmt(m1.dec_consume_cycles)} |")
+        print(f"| dec_decoder_valid_cycles | {fmt(m1.dec_decoder_valid_cycles)} |")
+        print(f"| dec_compute_req_cycles | {fmt(m1.dec_compute_req_cycles)} |")
+        print(f"| dec_compute_backpressure_cycles | {fmt(m1.dec_compute_backpressure_cycles)} |")
+        print(f"| dec_no_decoder_valid_cycles | {fmt(m1.dec_no_decoder_valid_cycles)} |")
+        print(f"| dec_both_ready_cycles | {fmt(m1.dec_both_ready_cycles)} |")
+        print(f"| dec_both_empty_cycles | {fmt(m1.dec_both_empty_cycles)} |")
+        print(f"| dec_id_only_wait_cycles | {fmt(m1.dec_id_only_wait_cycles)} |")
+        print(f"| dec_meta_only_wait_cycles | {fmt(m1.dec_meta_only_wait_cycles)} |")
+        print(f"| dec_id_q_occupancy_max | {fmt(m1.dec_id_q_occupancy_max)} |")
+        print(f"| dec_meta_q_occupancy_max | {fmt(m1.dec_meta_q_occupancy_max)} |")
         print("\nLogs:")
         print(f"- MODE1: {m1.sim_log}")
+    elif run_modes == (0,):
+        m0 = metrics_by_mode[0]
+        print("MODE0-only flow.")
+        print("| Metric | MODE0 |")
+        print("|---|---:|")
+        print(f"| pass | {m0.passed} |")
+        print(f"| mismatches | {fmt(m0.mismatches)} |")
+        print(f"| compute_beats | {fmt(m0.compute_beats)} |")
+        print(f"| all_data_ns | {fmt(m0.all_data_ns)} |")
+        print(f"| writeback_start_ns | {fmt(m0.writeback_start_ns)} |")
+        print(f"| finish_ns | {fmt(m0.finish_ns)} |")
+        print(f"| total_compute_to_finish_ns | {fmt(m0.total_compute_to_finish_ns)} |")
+        print(f"| ready_low_ratio | {fmt(m0.ready_low_ratio)} |")
+        print("\nLogs:")
+        print(f"- MODE0: {m0.sim_log}")
 
 
 if __name__ == "__main__":

@@ -399,6 +399,7 @@ module y_acc_banks #(
                 integer bank_hit_count;
                 integer preview_bank_hit_count;
                 integer queue_space;
+                integer issue_release_credit;
 
                 reg bank_issue_fire;
                 reg bank_head_conflict;
@@ -443,21 +444,6 @@ module y_acc_banks #(
                     bank_hit_count = merged_pp_bank_hit_count[bank_idx];
                     preview_bank_hit_count = merged_preview_bank_hit_count[bank_idx];
 
-                    if (ENABLE_PREVIEW_RESERVE) begin
-                        queue_space = QUEUE_DEPTH - bank_q_count - bank_reserved_count;
-                        bank_ready = (queue_space >= preview_bank_hit_count);
-                        bank_idle = (bank_q_count == 0) && (bank_reserved_count == 0);
-                    end else begin
-                        queue_space = QUEUE_DEPTH - bank_q_count;
-                        bank_ready = (queue_space >= bank_hit_count);
-                        bank_idle = (bank_q_count == 0);
-                    end
-                    for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
-                        if (bank_valid_pipe[pipe_idx]) begin
-                            bank_idle = 1'b0;
-                        end
-                    end
-
                     bank_issue_fire = 1'b0;
                     bank_head_conflict = 1'b0;
                     bank_issue_slot = {QUEUE_PTR_WIDTH{1'b0}};
@@ -491,6 +477,22 @@ module y_acc_banks #(
                                     bank_issue_data = bank_q_data[issue_sel_idx];
                                 end
                             end
+                        end
+                    end
+
+                    issue_release_credit = ((mode == 2'b10) && bank_issue_fire) ? 1 : 0;
+                    if (ENABLE_PREVIEW_RESERVE) begin
+                        queue_space = QUEUE_DEPTH - bank_q_count - bank_reserved_count + issue_release_credit;
+                        bank_ready = (queue_space >= preview_bank_hit_count);
+                        bank_idle = (bank_q_count == 0) && (bank_reserved_count == 0);
+                    end else begin
+                        queue_space = QUEUE_DEPTH - bank_q_count + issue_release_credit;
+                        bank_ready = (queue_space >= bank_hit_count);
+                        bank_idle = (bank_q_count == 0);
+                    end
+                    for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
+                        if (bank_valid_pipe[pipe_idx]) begin
+                            bank_idle = 1'b0;
                         end
                     end
                 end
@@ -697,6 +699,7 @@ module y_acc_banks #(
             integer enqueue_idx;
             integer bank_hit_count;
             integer queue_space;
+            integer issue_release_credit;
 
             reg bank_issue_fire;
             reg bank_head_conflict;
@@ -735,15 +738,6 @@ module y_acc_banks #(
                         end
                     end
 
-                    queue_space = QUEUE_DEPTH - bank_q_count;
-                    bank_ready = (queue_space >= bank_hit_count);
-                    bank_idle = (bank_q_count == 0);
-                    for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
-                        if (bank_valid_pipe[pipe_idx]) begin
-                            bank_idle = 1'b0;
-                        end
-                    end
-
                     bank_issue_fire = 1'b0;
                     bank_head_conflict = 1'b0;
                     bank_issue_slot = {QUEUE_PTR_WIDTH{1'b0}};
@@ -760,9 +754,9 @@ module y_acc_banks #(
                             end
                         end
 
-                        for (issue_sel_idx = 0; issue_sel_idx < issue_limit; issue_sel_idx = issue_sel_idx + 1) begin
+                        for (issue_sel_idx = 0; issue_sel_idx < QUEUE_DEPTH; issue_sel_idx = issue_sel_idx + 1) begin
                             bank_head_conflict = 1'b0;
-                            if (bank_q_valid[issue_sel_idx]) begin
+                            if ((issue_sel_idx < issue_limit) && bank_q_valid[issue_sel_idx]) begin
                                 for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
                                     if (bank_valid_pipe[pipe_idx] && (bank_addr_pipe[pipe_idx] == bank_q_addr[issue_sel_idx])) begin
                                         bank_head_conflict = 1'b1;
@@ -775,6 +769,16 @@ module y_acc_banks #(
                                     bank_issue_data = bank_q_data[issue_sel_idx];
                                 end
                             end
+                        end
+                    end
+
+                    issue_release_credit = ((mode == 2'b10) && bank_issue_fire) ? 1 : 0;
+                    queue_space = QUEUE_DEPTH - bank_q_count + issue_release_credit;
+                    bank_ready = (queue_space >= bank_hit_count);
+                    bank_idle = (bank_q_count == 0);
+                    for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
+                        if (bank_valid_pipe[pipe_idx]) begin
+                            bank_idle = 1'b0;
                         end
                     end
                 end

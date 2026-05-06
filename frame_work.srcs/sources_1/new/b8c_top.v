@@ -47,7 +47,7 @@ module b8c_top #(
     parameter SIM_USE_MUL_IP = 1'b1,     // 仿真时乘法: 1=IP, 0=行为模型
     parameter SIM_USE_ADD_IP = 1'b1,     // 仿真时加法: 1=IP, 0=行为模型
     parameter Y_QUEUE_DEPTH = 256,       // Y累加队列深度
-    parameter Y_LIMITED_BYPASS_WINDOW = 4, // Y累加旁路窗口
+    parameter Y_LIMITED_BYPASS_WINDOW = 32, // Y累加旁路窗口
     parameter SIM_ENABLE_BANK_STATS = 1'b0,      // 仿真时输出bank热点统计
     parameter SIM_PRINT_BATCH_BANK_STATS = 1'b0, // 仿真时输出每batch bank命中
     parameter SIM_ENABLE_STALL_REASON_STATS = 1'b0,

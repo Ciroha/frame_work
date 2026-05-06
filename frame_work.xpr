@@ -231,6 +231,10 @@
       <Config>
         <Option Name="DesignMode" Val="RTL"/>
         <Option Name="TopModule" Val="b8c_top"/>
+        <Generic Name="MODE_ID52" Val="0"/>
+        <Generic Name="PARALLELISM" Val="8"/>
+        <Generic Name="SIM_USE_MUL_IP" Val="1"/>
+        <Generic Name="SIM_USE_ADD_IP" Val="1"/>
       </Config>
     </FileSet>
     <FileSet Name="constrs_1" Type="Constrs" RelSrcDir="$PSRCDIR/constrs_1" RelGenDir="$PGENDIR/constrs_1">
