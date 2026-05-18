@@ -33,7 +33,9 @@ module b8c_decoder_id52 #(
     parameter META_BATCH        = 5,
     parameter ID_WIDTH          = 8,
     parameter DATA_WIDTH        = 64,
+    parameter ID52_METADATA_FORMAT = 1,
     parameter LUT_INIT_FILE     = "",
+    parameter SIM_ENABLE_LAYER1_TRACE = 1'b0,
     parameter DECOUPLE_ID_META  = 1'b0,
     parameter ID_Q_DEPTH        = 8,
     parameter META_Q_DEPTH      = 8
@@ -59,10 +61,19 @@ module b8c_decoder_id52 #(
 );
     localparam ID_VEC_W = PARALLELISM * ID_WIDTH;
     localparam META_VEC_W = PARALLELISM * 16 + 32; // {row_delta, col_base, row_base}
+    localparam META_BATCH_PHYS = (ID52_METADATA_FORMAT == 2) ? 3 : META_BATCH;
     localparam ID_Q_AW = (ID_Q_DEPTH <= 1) ? 1 : $clog2(ID_Q_DEPTH);
     localparam META_Q_AW = (META_Q_DEPTH <= 1) ? 1 : $clog2(META_Q_DEPTH);
     localparam ID_Q_CW = $clog2(ID_Q_DEPTH + 1);
     localparam META_Q_CW = $clog2(META_Q_DEPTH + 1);
+
+`ifndef SYNTHESIS
+    initial begin
+        if ((ID52_METADATA_FORMAT != 1) && (ID52_METADATA_FORMAT != 2)) begin
+            $fatal(1, "Unsupported ID52_METADATA_FORMAT=%0d", ID52_METADATA_FORMAT);
+        end
+    end
+`endif
 
     // ------------------------------------------------------------------------
     // Demux + FIFOs
@@ -75,7 +86,7 @@ module b8c_decoder_id52 #(
     stream_demux_id52 #(
         .AXI_WIDTH(AXI_WIDTH),
         .VAL_ID_BATCH(VAL_ID_BATCH),
-        .META_BATCH(META_BATCH)
+        .META_BATCH(META_BATCH_PHYS)
     ) u_demux (
         .clk(clk),
         .rst_n(rst_n),
@@ -136,21 +147,43 @@ module b8c_decoder_id52 #(
     wire id_next_cycle_req = DECOUPLE_ID_META ? id_push_dec : consume_step_lock;
     wire meta_next_cycle_req = DECOUPLE_ID_META ? meta_push_dec : consume_step_lock;
 
-    meta_parser #(
-        .AXI_WIDTH(AXI_WIDTH),
-        .PARALLELISM(PARALLELISM)
-    ) u_parser_meta (
-        .clk(clk),
-        .rst_n(rst_n),
-        .fifo_dout(meta_fifo_dout),
-        .fifo_empty(meta_empty),
-        .fifo_ren(meta_ren),
-        .next_cycle_req(meta_next_cycle_req),
-        .parser_valid(meta_valid),
-        .out_row_base(parser_row_base),
-        .out_col_base(parser_col_base),
-        .out_row_delta(parser_row_delta)
-    );
+    generate
+        if (ID52_METADATA_FORMAT == 2) begin : gen_meta_parser_v2
+            meta_parser_v2 #(
+                .AXI_WIDTH(AXI_WIDTH),
+                .PARALLELISM(PARALLELISM),
+                .ID_BATCH(VAL_ID_BATCH),
+                .ID_WIDTH(ID_WIDTH)
+            ) u_parser_meta (
+                .clk(clk),
+                .rst_n(rst_n),
+                .fifo_dout(meta_fifo_dout),
+                .fifo_empty(meta_empty),
+                .fifo_ren(meta_ren),
+                .next_cycle_req(meta_next_cycle_req),
+                .parser_valid(meta_valid),
+                .out_row_base(parser_row_base),
+                .out_col_base(parser_col_base),
+                .out_row_delta(parser_row_delta)
+            );
+        end else begin : gen_meta_parser_v1
+            meta_parser #(
+                .AXI_WIDTH(AXI_WIDTH),
+                .PARALLELISM(PARALLELISM)
+            ) u_parser_meta (
+                .clk(clk),
+                .rst_n(rst_n),
+                .fifo_dout(meta_fifo_dout),
+                .fifo_empty(meta_empty),
+                .fifo_ren(meta_ren),
+                .next_cycle_req(meta_next_cycle_req),
+                .parser_valid(meta_valid),
+                .out_row_base(parser_row_base),
+                .out_col_base(parser_col_base),
+                .out_row_delta(parser_row_delta)
+            );
+        end
+    endgenerate
 
     id_unpack_parser #(
         .AXI_WIDTH(AXI_WIDTH),

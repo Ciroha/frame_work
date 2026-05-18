@@ -440,7 +440,7 @@ def write_markdown(
         "## Project/report inventory",
         "",
         "- Vivado project: frame_work.xpr.",
-        "- Reused B8C synthesis script: run_synth_direct.tcl; it runs synth_design -top b8c_top and writes synth_direct_util.rpt plus synth_direct_timing.rpt.",
+        "- Reused B8C synthesis script: run_synth_direct.tcl; it runs synth_design -top top and writes synth_direct_util.rpt plus synth_direct_timing.rpt.",
         "- Existing implementation script not rerun: run_impl_direct.tcl; it would write timing_summary.rpt, timing_worst.rpt, utilization.rpt, drc.rpt, exceptions.rpt and clock_interaction.rpt.",
         "- Existing constraint file: frame_work.srcs/constrs_1/new/b8c_top_core.xdc defines create_clock -period 4.000, but synth_direct_timing.rpt reports no user specified timing constraints.",
         "- Existing add-lane OOC script/report set: run_fp64_add_lane_ooc_impl.tcl, fp64_add_lane_ooc_utilization.rpt, fp64_add_lane_ooc_timing_summary.rpt and fp64_add_lane_ooc_timing_worst.rpt.",
@@ -449,8 +449,8 @@ def write_markdown(
         "## RTL method mapping",
         "",
         "- csr: no CSR RTL top/report found; existing cycle comparison also marks CSR as model-only.",
-        "- b8c: b8c_top with MODE_ID52=0 and default PARALLELISM=8 instantiates the legacy b8c_decoder path.",
-        "- proposed_id_lut/proposed_id_codebook: b8c_top with MODE_ID52=1 uses b8c_decoder_id52, stream_demux_id52, id_unpack_parser, meta_parser and value_lut_decode.",
+        "- b8c: top with MODE_ID52=0 and default PARALLELISM=8 instantiates the legacy b8c_decoder path.",
+        "- proposed_id_lut/proposed_id_codebook: top with MODE_ID52=1 uses b8c_decoder_id52, stream_demux_id52, id_unpack_parser, meta_parser and value_lut_decode.",
         "- value_lut_decode stores ID/codebook values in a distributed ROM/LUTRAM-style array via rom_style=distributed.",
         "- bank-aware writeback/accumulation is y_acc_banks; no standalone or hierarchical utilization report was found for it.",
         "- No explicit adder_tree RTL module/report was found; fp64_add_lane OOC reports are listed only as add-path module evidence.",
@@ -478,7 +478,7 @@ def write_markdown(
     lines.extend(
         [
             "- To obtain report-backed full B8C Fmax, rerun or adapt run_impl_direct.tcl so b8c_top_core.xdc is applied, then collect report_utilization, report_timing_summary and report_timing outputs.",
-            "- To obtain proposed_id_lut/proposed_id_codebook resources, run separate Vivado synth/impl configurations for b8c_top with MODE_ID52=1, the intended PARALLELISM, and the intended LUT_INIT_FILE/codebook file, then emit report_utilization -hierarchical and report_timing_summary.",
+            "- To obtain proposed_id_lut/proposed_id_codebook resources, run separate Vivado synth/impl configurations for top with MODE_ID52=1, the intended PARALLELISM, and the intended LUT_INIT_FILE/codebook file, then emit report_utilization -hierarchical and report_timing_summary.",
             "- To split ID unpacker/LUT decoder/meta parser/y_acc_banks resources, generate a hierarchical utilization report, e.g. report_utilization -hierarchical -file <config>_util_hier.rpt after synthesis or implementation.",
             "",
             "## Analysis against requested questions",

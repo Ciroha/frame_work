@@ -39,7 +39,10 @@ from scipy import sparse as sp_sparse
 
 LANES = 8
 META_BATCH = 5
+META_BATCH_V2 = 3
+VAL_ID_BATCH = 2
 AXI_HEX_CHARS = 128  # 512 bits / 4
+AXI_BITS = AXI_HEX_CHARS * 4
 FP64_HEX_CHARS = 16
 AXI_FP64_PER_BEAT = AXI_HEX_CHARS // FP64_HEX_CHARS  # 8 x FP64 per 512-bit beat
 ID_HEX_CHARS = 2
@@ -52,7 +55,23 @@ class UniqueValueOverflowError(ValueError):
 
 def calc_val_batch(lanes: int) -> int:
     # Parser emits floor((5*512) / (32 + 16*lanes)) entries per metadata block.
-    return (META_BATCH * AXI_HEX_CHARS * 4) // (32 + 16 * lanes)
+    return (META_BATCH * AXI_BITS) // (32 + 16 * lanes)
+
+
+def calc_id52_emit_count(lanes: int) -> int:
+    return (VAL_ID_BATCH * AXI_BITS) // (lanes * 8)
+
+
+def calc_val_batch_for_metadata_format(lanes: int, metadata_format: str) -> int:
+    if metadata_format == "v2":
+        return calc_id52_emit_count(lanes)
+    return calc_val_batch(lanes)
+
+
+def meta_beats_per_block(metadata_format: str) -> int:
+    if metadata_format == "v2":
+        return META_BATCH_V2
+    return META_BATCH
 
 
 VAL_BATCH = calc_val_batch(LANES)
@@ -471,20 +490,59 @@ def build_meta_lines_for_chunk(chunk: Sequence[Beat]) -> List[str]:
     return lines
 
 
-def build_compute_id_stream(beats: Sequence[Beat], value_to_id: Dict[int, int]) -> List[str]:
+def build_meta_v2_lines_for_chunk(chunk: Sequence[Beat], block_index: int) -> List[str]:
+    if len(chunk) != VAL_BATCH:
+        raise ValueError(f"metadata_v2 chunk must be {VAL_BATCH} beats, got {len(chunk)}")
+    slice_w = 32 + 8 * LANES
+    required_bits = len(chunk) * slice_w
+    if required_bits > META_BATCH_V2 * AXI_BITS:
+        raise ValueError(
+            f"metadata_v2 block too wide: lanes={LANES}, value_batch={len(chunk)}, "
+            f"required_bits={required_bits}, capacity_bits={META_BATCH_V2 * AXI_BITS}"
+        )
+
+    blob = 0
+    for i, b in enumerate(chunk):
+        slice_bits = 0
+        slice_bits |= (b.row_base & 0xFFFF)
+        slice_bits |= (b.col_base & 0xFFFF) << 16
+        for lane in range(LANES):
+            delta = int(b.row_delta[lane])
+            if delta < 0 or delta > 0xFF:
+                raise ValueError(
+                    "metadata_v2 row_delta overflow at "
+                    f"block={block_index} beat={i} lane={lane}: "
+                    f"row_base={b.row_base} row={b.row_base + delta} delta={delta}; requires <=255"
+                )
+            slice_bits |= (delta & 0xFF) << (32 + 8 * lane)
+        blob |= slice_bits << (slice_w * i)
+
+    lines: List[str] = []
+    for k in range(META_BATCH_V2):
+        line_val = (blob >> (AXI_BITS * k)) & ((1 << AXI_BITS) - 1)
+        lines.append(f"{line_val:0{AXI_HEX_CHARS}X}")
+    return lines
+
+
+def build_compute_id_stream(
+    beats: Sequence[Beat],
+    value_to_id: Dict[int, int],
+    metadata_format: str = "v1",
+) -> List[str]:
     lines: List[str] = []
     if len(beats) % VAL_BATCH != 0:
         raise ValueError(f"beat count must be multiple of {VAL_BATCH}")
 
     ids_per_block = VAL_BATCH * LANES
     id_beats_per_block = math.ceil(ids_per_block / ID_PER_AXI_BEAT)
+    meta_batch = meta_beats_per_block(metadata_format)
     zero_bits = int(f64_to_u64(0.0))
     if zero_bits not in value_to_id:
         raise KeyError("zero value bits missing in LUT mapping for ID-stream padding")
     zero_id = value_to_id[zero_bits]
 
     # Stream order:
-    # [ID beats for 16 value beats][5 metadata beats]...
+    # [ID beats for value beats][metadata beats]...
     for blk in range(len(beats) // VAL_BATCH):
         chunk = beats[blk * VAL_BATCH : (blk + 1) * VAL_BATCH]
 
@@ -496,17 +554,23 @@ def build_compute_id_stream(beats: Sequence[Beat], value_to_id: Dict[int, int]) 
                     raise KeyError(f"value bits 0x{bits:016X} missing in LUT mapping")
                 block_ids.append(value_to_id[bits])
 
+        block_start = len(lines)
         for i in range(0, len(block_ids), ID_PER_AXI_BEAT):
             sub = block_ids[i : i + ID_PER_AXI_BEAT]
             if len(sub) < ID_PER_AXI_BEAT:
                 sub = sub + [zero_id] * (ID_PER_AXI_BEAT - len(sub))
             lines.append(pack_axi_beat_u8_lane0_first(sub))
 
-        # Defensive pad, in case ids_per_block is not exactly divisible by ID_PER_AXI_BEAT.
-        while (len(lines) % (id_beats_per_block + META_BATCH)) < id_beats_per_block:
+        while (len(lines) - block_start) < id_beats_per_block:
             lines.append(pack_axi_beat_u8_lane0_first([zero_id] * ID_PER_AXI_BEAT))
 
-        lines.extend(build_meta_lines_for_chunk(chunk))
+        if metadata_format == "v2":
+            lines.extend(build_meta_v2_lines_for_chunk(chunk, blk))
+        else:
+            lines.extend(build_meta_lines_for_chunk(chunk))
+
+        if (len(lines) - block_start) != id_beats_per_block + meta_batch:
+            raise RuntimeError("internal compute_id_stream block width mismatch")
 
     return lines
 
@@ -582,7 +646,8 @@ def main() -> None:
     src.add_argument("--clustered-json", help="input clustered matrix JSON file")
 
     ap.add_argument("--out-dir", required=True, help="output directory for .hex files")
-    ap.add_argument("--lanes", type=int, choices=(8, 16), default=8, help="compute lanes (tb PARALLELISM)")
+    ap.add_argument("--lanes", type=int, choices=(8, 16, 32), default=8, help="compute lanes (tb PARALLELISM)")
+    ap.add_argument("--metadata-format", choices=("v1", "v2"), default="v1", help="ID52 metadata encoding")
     ap.add_argument("--vector-depth", type=int, default=16, help="X logical depth (tb VECTOR_DEPTH)")
     ap.add_argument("--y-elems", type=int, default=None, help="Y scalar length (default: max row + 1)")
     ap.add_argument("--x-file", default=None, help="optional x vector text file (one value per line)")
@@ -595,9 +660,11 @@ def main() -> None:
     args = ap.parse_args()
 
     LANES = args.lanes
-    VAL_BATCH = calc_val_batch(LANES)
+    VAL_BATCH = calc_val_batch_for_metadata_format(LANES, args.metadata_format)
     if VAL_BATCH <= 0:
         raise ValueError(f"invalid VAL_BATCH={VAL_BATCH} for lanes={LANES}")
+    if args.metadata_format == "v2" and LANES != 32:
+        raise ValueError("metadata_v2 is currently supported only for --lanes 32")
     if (LANES % AXI_FP64_PER_BEAT) != 0:
         raise ValueError(f"lanes ({LANES}) must be a multiple of {AXI_FP64_PER_BEAT}")
 
@@ -605,9 +672,14 @@ def main() -> None:
         raise ValueError("--vector-depth must be > 0")
 
     input_kind = "b8c-json"
+    id_beats_per_block = math.ceil((VAL_BATCH * LANES) / ID_PER_AXI_BEAT)
+    metadata_beats_per_block = meta_beats_per_block(args.metadata_format)
     audit_metadata = {
         "lanes": LANES,
+        "metadata_format": args.metadata_format,
         "value_batch": VAL_BATCH,
+        "id_beats_per_block": id_beats_per_block,
+        "meta_beats_per_block": metadata_beats_per_block,
         "vector_depth": args.vector_depth,
         "symmetric_upper_only": bool(args.symmetric_upper_only),
     }
@@ -671,7 +743,7 @@ def main() -> None:
                 value_stream_values=aligned_stream_vals,
             )
             mapped_nnz = int(mapped_csr.data.size)
-            compute_id_stream = build_compute_id_stream(beats, value_to_id)
+            compute_id_stream = build_compute_id_stream(beats, value_to_id, args.metadata_format)
         except UniqueValueOverflowError:
             if LANES != AXI_FP64_PER_BEAT:
                 raise ValueError("--mtx input exceeds 8-bit LUT capacity for MODE_ID52; use clustered-json or lanes=8 exact path")
@@ -689,7 +761,7 @@ def main() -> None:
             args.out_dir,
             value_stream_values=aligned_stream_vals,
         )
-        compute_id_stream = build_compute_id_stream(beats, value_to_id)
+        compute_id_stream = build_compute_id_stream(beats, value_to_id, args.metadata_format)
 
     y_elems = args.y_elems if args.y_elems is not None else m_rows
     if y_elems <= 0:
@@ -740,6 +812,9 @@ def main() -> None:
             "compute_stream_beats": compute_beats,
             "compute_stream_generated": bool(compute_stream),
             "compute_id_stream_generated": compute_id_stream is not None,
+            "compute_id_stream_beats": len(compute_id_stream) if compute_id_stream is not None else 0,
+            "compute_id_stream_id_beats": blocks * id_beats_per_block if compute_id_stream is not None else 0,
+            "compute_id_stream_meta_beats": blocks * metadata_beats_per_block if compute_id_stream is not None else 0,
             "golden_y_scalars": len(golden_hex),
         }
     )
@@ -760,14 +835,14 @@ def main() -> None:
     print("  artifact_audit.json written")
     if lut_u64 is not None:
         id_beats = math.ceil(aligned_vals / ID_PER_AXI_BEAT)
-        id_beats_per_block = math.ceil((VAL_BATCH * LANES) / ID_PER_AXI_BEAT)
-        compute_id_beats = blocks * (id_beats_per_block + META_BATCH)
+        compute_id_beats = blocks * (id_beats_per_block + metadata_beats_per_block)
         print(f"  lut.hex            entries={len(lut_u64)}")
         nnz_for_print = mapped_nnz if mapped_nnz is not None else 0
         print(f"  value_id_stream.hex beats={id_beats} (aligned_values={aligned_vals}, nnz={nnz_for_print})")
         print(
             f"  compute_id_stream.hex beats={compute_id_beats} "
-            f"(id={blocks*id_beats_per_block}, meta={blocks*META_BATCH})"
+            f"(metadata_format={args.metadata_format}, id={blocks*id_beats_per_block}, "
+            f"meta={blocks*metadata_beats_per_block})"
         )
     print("")
     print("Suggested tb parameters:")

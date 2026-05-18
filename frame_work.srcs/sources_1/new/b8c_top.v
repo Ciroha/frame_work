@@ -1,7 +1,7 @@
 `timescale 1ns / 1ps
 
 // ============================================================================
-// Module: b8c_top
+// Module: top
 // ============================================================================
 // 功能描述:
 //   这是SpMV（稀疏矩阵-向量乘法）加速器的顶层模块。
@@ -25,20 +25,21 @@
 //
 // 并行度:
 //   - PARALLELISM=8:  8通道并行计算（默认）
-//   - PARALLELISM=16: 16通道并行计算（仅支持MODE_ID52模式）
+//   - PARALLELISM=16/32: 资源扩展并行计算（仅支持MODE_ID52模式）
 //
 // 对称矩阵优化:
 //   - SYMMETRIC_UPPER_ONLY=1: 仅存储上三角，自动计算对称元素贡献
 // ============================================================================
 
-module b8c_top #(
+module top #(
     // ========================================================================
     // 参数定义
     // ========================================================================
-    parameter PARALLELISM = 8,           // 并行计算通道数(8或16)
+    parameter PARALLELISM = 8,           // 并行计算通道数(8/16/32)
     parameter DATA_WIDTH  = 64,          // 数据位宽(FP64为64位)
     parameter AXI_WIDTH   = 512,         // AXI-Stream接口位宽
     parameter MODE_ID52   = 1'b0,        // 工作模式: 0=传统FP64模式, 1=ID-LUT压缩模式
+    parameter ID52_METADATA_FORMAT = 1,
     parameter SYMMETRIC_UPPER_ONLY = 1'b0, // 对称矩阵优化: 仅计算上三角
     parameter LUT_INIT_FILE = "",        // LUT初始化文件路径(MODE_ID52模式使用)
     parameter DECOUPLE_ID_META = 1'b0,   // ID/Meta解耦使能(提高吞吐量)
@@ -48,9 +49,11 @@ module b8c_top #(
     parameter SIM_USE_ADD_IP = 1'b1,     // 仿真时加法: 1=IP, 0=行为模型
     parameter Y_QUEUE_DEPTH = 256,       // Y累加队列深度
     parameter Y_LIMITED_BYPASS_WINDOW = 32, // Y累加旁路窗口
+    parameter Y_ISSUE_WINDOW = 8,        // Y累加调度物理发射窗口
     parameter SIM_ENABLE_BANK_STATS = 1'b0,      // 仿真时输出bank热点统计
     parameter SIM_PRINT_BATCH_BANK_STATS = 1'b0, // 仿真时输出每batch bank命中
     parameter SIM_ENABLE_STALL_REASON_STATS = 1'b0,
+    parameter SIM_ENABLE_LAYER1_TRACE = 1'b0,
     parameter VECTOR_DEPTH = 4096,       // X向量存储深度
     parameter Y_ELEMS      = 23,         // Y向量元素个数
     parameter ADDR_WIDTH   = ((((VECTOR_DEPTH > Y_ELEMS) ? VECTOR_DEPTH : Y_ELEMS) <= 1) ?
@@ -93,7 +96,7 @@ module b8c_top #(
     localparam integer META_OUT_STAGE = FP64_MUL_LATENCY + 1; // 元数据对齐到乘法输出
     localparam integer COMPUTE_DRAIN_CYCLES = FP64_MUL_LATENCY + 3;  // 计算流水线排空周期数
     localparam CONTINUOUS_ISSUE_MODE = MODE_ID52 &&
-                                       ((PARALLELISM == 8) || (PARALLELISM == 16)) &&
+                                       ((PARALLELISM == 8) || (PARALLELISM == 16) || (PARALLELISM == 32)) &&
                                        !SYMMETRIC_UPPER_ONLY;
     localparam SYMM_CONTINUOUS_ISSUE_MODE = MODE_ID52 &&
                                             (PARALLELISM == 16) &&
@@ -119,11 +122,17 @@ module b8c_top #(
         if (PARALLELISM % IO_LANES != 0) begin
             $fatal(1, "PARALLELISM (%0d) must be multiple of IO_LANES (%0d)", PARALLELISM, IO_LANES);
         end
-        if ((LANE_RATIO != 1) && (LANE_RATIO != 2)) begin
-            $fatal(1, "Unsupported LANE_RATIO=%0d (only 1 or 2 supported)", LANE_RATIO);
+        if ((LANE_RATIO != 1) && (LANE_RATIO != 2) && (LANE_RATIO != 4)) begin
+            $fatal(1, "Unsupported LANE_RATIO=%0d (only 1, 2, or 4 supported)", LANE_RATIO);
         end
-        if ((PARALLELISM == 16) && (MODE_ID52 == 1'b0)) begin
-            $fatal(1, "PARALLELISM=16 is only supported for MODE_ID52=1 in this version");
+        if ((PARALLELISM > IO_LANES) && (MODE_ID52 == 1'b0)) begin
+            $fatal(1, "PARALLELISM>%0d is only supported for MODE_ID52=1 in this version", IO_LANES);
+        end
+        if ((ID52_METADATA_FORMAT != 1) && (ID52_METADATA_FORMAT != 2)) begin
+            $fatal(1, "Unsupported ID52_METADATA_FORMAT=%0d", ID52_METADATA_FORMAT);
+        end
+        if ((ID52_METADATA_FORMAT == 2) && ((MODE_ID52 == 1'b0) || (PARALLELISM != 32))) begin
+            $fatal(1, "ID52_METADATA_FORMAT=2 currently requires MODE_ID52=1 and PARALLELISM=32");
         end
         if (SYMMETRIC_UPPER_ONLY && ((MODE_ID52 == 1'b0) || (PARALLELISM != 16))) begin
             $fatal(1, "SYMMETRIC_UPPER_ONLY currently requires MODE_ID52=1 and PARALLELISM=16");
@@ -168,6 +177,7 @@ module b8c_top #(
     reg  [COMPUTE_DRAIN_CYCLES-1:0]    compute_inflight_pipe;
     wire                              compute_mul_busy;
     integer                           pipe_idx;
+    integer                           load_seg_idx;
 
     assign compute_mul_busy = |compute_inflight_pipe;
 
@@ -367,6 +377,25 @@ module b8c_top #(
                               ((state == S_COMPUTE) && acc_idle && !compute_mul_busy);
     assign compute_fire = decoder_val && compute_req_next;
 
+`ifndef SYNTHESIS
+    always @(posedge clk) begin
+        if (rst_n && SIM_ENABLE_LAYER1_TRACE && (state == S_COMPUTE)) begin
+            if (decoder_val || compute_req_next) begin
+                $display("L1_TRACE event=decoder_refill cycle=%0d lane=-1 bank=-1 valid=%0d ready=%0d fire=%0d address=-1 queue_depth=-1 source=top.decoder_valid_ready calibrated=1 derived=0 gap=none",
+                         ($time / 10000), decoder_val, compute_req_next, compute_fire);
+            end
+            if (compute_fire) begin
+                $display("L1_TRACE event=compute_fire cycle=%0d lane=-1 bank=-1 valid=%0d ready=%0d fire=1 address=-1 queue_depth=-1 source=top.compute_fire calibrated=1 derived=0 gap=none",
+                         ($time / 10000), decoder_val, compute_req_next);
+            end
+            if ((|pp_valid_main) || (|pp_valid_sym)) begin
+                $display("L1_TRACE event=multiply_retire cycle=%0d lane=-1 bank=-1 valid=1 ready=1 fire=1 address=-1 queue_depth=-1 source=top.compute_pipeline_valid calibrated=1 derived=0 gap=none",
+                         ($time / 10000));
+            end
+        end
+    end
+`endif
+
     // s_axis_tready 生成: 根据状态决定是否接收数据
     reg s_axis_tready_comb;
     always @(*) begin
@@ -413,10 +442,12 @@ module b8c_top #(
                 .META_BATCH(5),
                 .ID_WIDTH(8),
                 .DATA_WIDTH(DATA_WIDTH),
+                .ID52_METADATA_FORMAT(ID52_METADATA_FORMAT),
                 .LUT_INIT_FILE(LUT_INIT_FILE),
                 .DECOUPLE_ID_META(DECOUPLE_ID_META),
                 .ID_Q_DEPTH(ID_Q_DEPTH),
-                .META_Q_DEPTH(META_Q_DEPTH)
+                .META_Q_DEPTH(META_Q_DEPTH),
+                .SIM_ENABLE_LAYER1_TRACE(SIM_ENABLE_LAYER1_TRACE)
             ) u_decoder (
                 .clk(clk),
                 .rst_n(rst_n),
@@ -461,32 +492,46 @@ module b8c_top #(
 
     // ========================================================================
     // X向量加载逻辑
-    // 支持LANE_RATIO=1(512->8通道) 或 LANE_RATIO=2(512->16通道)
+    // 支持LANE_RATIO=1/2/4，将多拍AXI输入拼成一个逻辑并行向量
     // ========================================================================
-    reg [AXI_WIDTH-1:0] x_half_buf;  // 半拍数据缓存(用于LANE_RATIO=2)
+    reg [AXI_WIDTH-1:0] x_load_buf0;
+    reg [AXI_WIDTH-1:0] x_load_buf1;
+    reg [AXI_WIDTH-1:0] x_load_buf2;
+    reg [PARALLELISM*DATA_WIDTH-1:0] x_load_data_r;
     wire x_phase = (state == S_IDLE) || (state == S_LOAD_X);
-    wire x_first_half = (LANE_RATIO == 2) && x_phase && in_handshake && (load_cnt[0] == 1'b0);
-    wire x_load_fire = x_phase && in_handshake && ((LANE_RATIO == 1) || (load_cnt[0] == 1'b1));
-    wire [31:0] x_load_addr_full = (LANE_RATIO == 1) ? load_cnt : (load_cnt >> 1);
-    wire [PARALLELISM*DATA_WIDTH-1:0] x_load_data_w;
+    wire x_load_fire = x_phase && in_handshake && ((load_cnt % LANE_RATIO) == LANE_RATIO - 1);
+    wire [31:0] x_load_addr_full = load_cnt / LANE_RATIO;
+    wire [PARALLELISM*DATA_WIDTH-1:0] x_load_data_w = x_load_data_r;
 
-    // 半拍数据缓存
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            x_half_buf <= {AXI_WIDTH{1'b0}};
-        end else if (x_first_half) begin
-            x_half_buf <= s_axis_tdata;
+            x_load_buf0 <= {AXI_WIDTH{1'b0}};
+            x_load_buf1 <= {AXI_WIDTH{1'b0}};
+            x_load_buf2 <= {AXI_WIDTH{1'b0}};
+        end else if (x_phase && in_handshake) begin
+            case (load_cnt % LANE_RATIO)
+                0: x_load_buf0 <= s_axis_tdata;
+                1: x_load_buf1 <= s_axis_tdata;
+                2: x_load_buf2 <= s_axis_tdata;
+                default: begin end
+            endcase
         end
     end
 
-    // 数据拼接(用于LANE_RATIO=2)
-    generate
-        if (LANE_RATIO == 1) begin : gen_x_load_direct
-            assign x_load_data_w = s_axis_tdata;
-        end else begin : gen_x_load_pair
-            assign x_load_data_w = {s_axis_tdata, x_half_buf};
+    always @(*) begin
+        x_load_data_r = {PARALLELISM*DATA_WIDTH{1'b0}};
+        for (load_seg_idx = 0; load_seg_idx < LANE_RATIO; load_seg_idx = load_seg_idx + 1) begin
+            if (load_seg_idx == LANE_RATIO - 1) begin
+                x_load_data_r[load_seg_idx*AXI_WIDTH +: AXI_WIDTH] = s_axis_tdata;
+            end else if (load_seg_idx == 0) begin
+                x_load_data_r[load_seg_idx*AXI_WIDTH +: AXI_WIDTH] = x_load_buf0;
+            end else if (load_seg_idx == 1) begin
+                x_load_data_r[load_seg_idx*AXI_WIDTH +: AXI_WIDTH] = x_load_buf1;
+            end else begin
+                x_load_data_r[load_seg_idx*AXI_WIDTH +: AXI_WIDTH] = x_load_buf2;
+            end
         end
-    endgenerate
+    end
 
     // ========================================================================
     // X向量存储器实例化
@@ -707,31 +752,48 @@ module b8c_top #(
     // ========================================================================
     // Y向量加载逻辑
     // ========================================================================
-    reg [AXI_WIDTH-1:0] y_half_buf;  // 半拍数据缓存(用于LANE_RATIO=2)
-    wire y_load_first_half = (LANE_RATIO == 2) && (state == S_LOAD_Y) && in_handshake && (load_cnt[0] == 1'b0);
-    wire y_load_tail_single = (LANE_RATIO == 2) && (state == S_LOAD_Y) && in_handshake &&
-                              (load_cnt[0] == 1'b0) && (load_cnt == Y_AXI_BEATS - 1);
+    reg [AXI_WIDTH-1:0] y_load_buf0;
+    reg [AXI_WIDTH-1:0] y_load_buf1;
+    reg [AXI_WIDTH-1:0] y_load_buf2;
+    reg [PARALLELISM*DATA_WIDTH-1:0] y_load_data_r;
+    wire [31:0] y_load_seg = load_cnt % LANE_RATIO;
+    wire y_load_tail = (load_cnt == Y_AXI_BEATS - 1);
     wire y_load_fire = (state == S_LOAD_Y) && in_handshake &&
-                       ((LANE_RATIO == 1) || (load_cnt[0] == 1'b1) || y_load_tail_single);
-    wire [31:0] y_load_addr_full = (LANE_RATIO == 1) ? load_cnt : (load_cnt >> 1);
-    wire [PARALLELISM*DATA_WIDTH-1:0] y_load_data_w;
+                       ((y_load_seg == LANE_RATIO - 1) || y_load_tail);
+    wire [31:0] y_load_addr_full = load_cnt / LANE_RATIO;
+    wire [PARALLELISM*DATA_WIDTH-1:0] y_load_data_w = y_load_data_r;
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            y_half_buf <= {AXI_WIDTH{1'b0}};
-        end else if (y_load_first_half) begin
-            y_half_buf <= s_axis_tdata;
+            y_load_buf0 <= {AXI_WIDTH{1'b0}};
+            y_load_buf1 <= {AXI_WIDTH{1'b0}};
+            y_load_buf2 <= {AXI_WIDTH{1'b0}};
+        end else if ((state == S_LOAD_Y) && in_handshake) begin
+            case (y_load_seg)
+                0: y_load_buf0 <= s_axis_tdata;
+                1: y_load_buf1 <= s_axis_tdata;
+                2: y_load_buf2 <= s_axis_tdata;
+                default: begin end
+            endcase
         end
     end
 
-    generate
-        if (LANE_RATIO == 1) begin : gen_y_load_direct
-            assign y_load_data_w = s_axis_tdata;
-        end else begin : gen_y_load_pair
-            assign y_load_data_w = y_load_tail_single ? {{AXI_WIDTH{1'b0}}, s_axis_tdata} :
-                                                     {s_axis_tdata, y_half_buf};
+    always @(*) begin
+        y_load_data_r = {PARALLELISM*DATA_WIDTH{1'b0}};
+        for (load_seg_idx = 0; load_seg_idx < LANE_RATIO; load_seg_idx = load_seg_idx + 1) begin
+            if (load_seg_idx < y_load_seg) begin
+                if (load_seg_idx == 0) begin
+                    y_load_data_r[load_seg_idx*AXI_WIDTH +: AXI_WIDTH] = y_load_buf0;
+                end else if (load_seg_idx == 1) begin
+                    y_load_data_r[load_seg_idx*AXI_WIDTH +: AXI_WIDTH] = y_load_buf1;
+                end else begin
+                    y_load_data_r[load_seg_idx*AXI_WIDTH +: AXI_WIDTH] = y_load_buf2;
+                end
+            end else if (load_seg_idx == y_load_seg) begin
+                y_load_data_r[load_seg_idx*AXI_WIDTH +: AXI_WIDTH] = s_axis_tdata;
+            end
         end
-    endgenerate
+    end
 
     // ========================================================================
     // Y向量输出控制状态机
@@ -740,7 +802,7 @@ module b8c_top #(
     reg                                y_store_fetch_pending; // 读请求挂起标志
     reg [PARALLELISM*DATA_WIDTH-1:0]   y_store_buf;           // 输出数据缓存
     reg                                y_store_buf_valid;     // 缓存有效标志
-    reg                                store_half_sel;        // 半拍选择(LANE_RATIO=2)
+    reg [1:0]                          store_seg_sel;
 
     wire y_store_fetch_req = (state == S_STORE_Y) &&
                              !y_store_fetch_pending &&
@@ -754,11 +816,7 @@ module b8c_top #(
     wire y_ls_en = (state == S_LOAD_Y) ? y_load_fire :
                    ((state == S_STORE_Y) ? y_store_fetch_req : 1'b0);
 
-    // 输出AXI数据选择(LANE_RATIO=2时需要分两次输出)
-    wire [AXI_WIDTH-1:0] y_store_axi_word =
-        (LANE_RATIO == 2) ?
-            (store_half_sel ? y_store_buf[AXI_WIDTH +: AXI_WIDTH] : y_store_buf[0 +: AXI_WIDTH]) :
-            y_store_buf[0 +: AXI_WIDTH];
+    wire [AXI_WIDTH-1:0] y_store_axi_word = y_store_buf[store_seg_sel*AXI_WIDTH +: AXI_WIDTH];
 
     // Y输出控制状态机
     always @(posedge clk or negedge rst_n) begin
@@ -767,14 +825,14 @@ module b8c_top #(
             y_store_fetch_pending <= 1'b0;
             y_store_buf <= {PARALLELISM*DATA_WIDTH{1'b0}};
             y_store_buf_valid <= 1'b0;
-            store_half_sel <= 1'b0;
+            store_seg_sel <= 1'b0;
         end else if (state != S_STORE_Y) begin
             // 非输出状态时复位输出控制
             y_store_req_addr <= {ADDR_WIDTH{1'b0}};
             y_store_fetch_pending <= 1'b0;
             y_store_buf <= {PARALLELISM*DATA_WIDTH{1'b0}};
             y_store_buf_valid <= 1'b0;
-            store_half_sel <= 1'b0;
+            store_seg_sel <= 1'b0;
         end else begin
             // 发起读请求
             if (y_store_fetch_req) begin
@@ -787,18 +845,16 @@ module b8c_top #(
                 y_store_fetch_pending <= 1'b0;
                 y_store_buf <= y_store_data;
                 y_store_buf_valid <= 1'b1;
-                store_half_sel <= 1'b0;
+                store_seg_sel <= 1'b0;
             end
 
             // AXI输出握手
             if (out_handshake) begin
-                if (LANE_RATIO == 1) begin
+                if (store_seg_sel == LANE_RATIO - 1) begin
+                    store_seg_sel <= 2'b00;
                     y_store_buf_valid <= 1'b0;
-                end else if (!store_half_sel) begin
-                    store_half_sel <= 1'b1;  // 第一半拍完成,输出第二半拍
                 end else begin
-                    store_half_sel <= 1'b0;
-                    y_store_buf_valid <= 1'b0;  // 两半拍都完成
+                    store_seg_sel <= store_seg_sel + 1'b1;
                 end
             end
         end
@@ -814,11 +870,13 @@ module b8c_top #(
         .ADDR_WIDTH(ADDR_WIDTH),
         .QUEUE_DEPTH(Y_QUEUE_DEPTH),
         .LIMITED_BYPASS_WINDOW(Y_LIMITED_BYPASS_WINDOW),
+        .ISSUE_WINDOW(Y_ISSUE_WINDOW),
         .SIM_USE_IP(SIM_USE_ADD_IP),
         .ENABLE_PREVIEW_RESERVE(CONTINUOUS_ADMISSION_MODE),
         .SIM_ENABLE_BANK_STATS(SIM_ENABLE_BANK_STATS),
         .SIM_PRINT_BATCH_BANK_STATS(SIM_PRINT_BATCH_BANK_STATS),
         .SIM_ENABLE_STALL_REASON_STATS(SIM_ENABLE_STALL_REASON_STATS),
+        .SIM_ENABLE_LAYER1_TRACE(SIM_ENABLE_LAYER1_TRACE),
         .ENABLE_LIMITED_BYPASS(CONTINUOUS_ADMISSION_MODE)
     ) u_y_acc (
         .clk(clk),

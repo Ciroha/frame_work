@@ -3,44 +3,49 @@
 module tb_b8c_top_ram();
 
     parameter AXI_WIDTH    = 512;
-    parameter PARALLELISM  = 16;
+    parameter PARALLELISM  = 32;
     parameter MODE_ID52    = 1'b1;
-    parameter SYMMETRIC_UPPER_ONLY = 1'b1;
+    parameter ID52_METADATA_FORMAT = 2;
+    parameter SYMMETRIC_UPPER_ONLY = 1'b0;
     parameter SIM_USE_MUL_IP = 1'b1;
     parameter SIM_USE_ADD_IP = 1'b1;
     parameter Y_QUEUE_DEPTH = 256;
     parameter Y_LIMITED_BYPASS_WINDOW = 4;
+    parameter Y_ISSUE_WINDOW = 4;
     parameter SIM_ENABLE_BANK_STATS = 1'b1;
     parameter SIM_PRINT_BATCH_BANK_STATS = 1'b0;
     parameter SIM_ENABLE_STALL_REASON_STATS = 1'b1;
+    parameter SIM_ENABLE_LAYER1_TRACE = 1'b1;
     parameter DECOUPLE_ID_META = 1'b0;
     parameter ID_Q_DEPTH   = 8;
     parameter META_Q_DEPTH = 8;
     parameter real Y_ABS_TOL = 1e-9;
-    parameter VECTOR_DEPTH = 256;
-    parameter Y_ELEMS      = 4096;
-    parameter MAT_DATA_BEATS = 3304;
+    parameter VECTOR_DEPTH = 257;
+    parameter Y_ELEMS      = 2053;
+    parameter MAT_DATA_BEATS = 588;
     localparam IO_LANES       = AXI_WIDTH / 64;
     localparam LANE_RATIO     = PARALLELISM / IO_LANES;
     localparam MAX_ADDR_ELEMS = (VECTOR_DEPTH > Y_ELEMS) ? VECTOR_DEPTH : Y_ELEMS;
     localparam ADDR_WIDTH     = (MAX_ADDR_ELEMS <= 1) ? 1 : $clog2(MAX_ADDR_ELEMS);
     localparam X_STREAM_BEATS = VECTOR_DEPTH * LANE_RATIO;
     localparam Y_AXI_BEATS    = (Y_ELEMS + IO_LANES - 1) / IO_LANES;
-    localparam META_EMIT_BEATS = (5 * AXI_WIDTH) / (PARALLELISM * 16 + 32);
+    localparam META_PHYS_BATCH = (ID52_METADATA_FORMAT == 2) ? 3 : 5;
+    localparam META_EMIT_BEATS = (ID52_METADATA_FORMAT == 2) ? ((2 * AXI_WIDTH) / (PARALLELISM * 8)) : ((5 * AXI_WIDTH) / (PARALLELISM * 16 + 32));
     localparam META_BEATS     = (MAT_DATA_BEATS / META_EMIT_BEATS) * 5;
+    localparam ID52_META_BEATS = (MAT_DATA_BEATS / META_EMIT_BEATS) * META_PHYS_BATCH;
     localparam COMPUTE_BEATS  = MAT_DATA_BEATS + META_BEATS;
     localparam ID_VALS_PER_BEAT = AXI_WIDTH / 8;
     localparam ID_DATA_BEATS  = (MAT_DATA_BEATS * PARALLELISM + ID_VALS_PER_BEAT - 1) / ID_VALS_PER_BEAT;
-    localparam COMPUTE_ID_BEATS = ID_DATA_BEATS + META_BEATS;
+    localparam COMPUTE_ID_BEATS = ID_DATA_BEATS + ID52_META_BEATS;
     localparam ACTIVE_COMPUTE_BEATS = MODE_ID52 ? COMPUTE_ID_BEATS : COMPUTE_BEATS;
     localparam COMPUTE_STREAM_MEM_BEATS = (COMPUTE_BEATS > COMPUTE_ID_BEATS) ? COMPUTE_BEATS : COMPUTE_ID_BEATS;
 
-    parameter string X_STREAM_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/x_stream.hex";
-    parameter string Y_STREAM_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/y_stream.hex";
-    parameter string COMPUTE_STREAM_FILE = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/compute_stream.hex";
-    parameter string COMPUTE_ID_STREAM_FILE = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/compute_id_stream.hex";
-    parameter string LUT_FILE            = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/lut.hex";
-    parameter string GOLDEN_Y_FILE       = "C:/IC/FPGA/frame_work/frame_work.srcs/sim_1/data/hpcg_16-1_l16_symm/golden_y.hex";
+    parameter string X_STREAM_FILE       = "C:/IC/FPGA/frame_work/.omc/tmp_cheb_clustered_p32_v2/x_stream.hex";
+    parameter string Y_STREAM_FILE       = "C:/IC/FPGA/frame_work/.omc/tmp_cheb_clustered_p32_v2/y_stream.hex";
+    parameter string COMPUTE_STREAM_FILE = "C:/IC/FPGA/frame_work/.omc/tmp_cheb_clustered_p32_v2/compute_stream.hex";
+    parameter string COMPUTE_ID_STREAM_FILE = "C:/IC/FPGA/frame_work/.omc/tmp_cheb_clustered_p32_v2/compute_id_stream.hex";
+    parameter string LUT_FILE            = "C:/IC/FPGA/frame_work/.omc/tmp_cheb_clustered_p32_v2/lut.hex";
+    parameter string GOLDEN_Y_FILE       = "C:/IC/FPGA/frame_work/.omc/tmp_cheb_clustered_p32_v2/golden_y.hex";
 
     localparam [63:0] FP64_1_0 = 64'h3FF0_0000_0000_0000;
     localparam [63:0] FP64_2_0 = 64'h4000_0000_0000_0000;
@@ -68,18 +73,21 @@ module tb_b8c_top_ram();
     int compute_ready_high_cycles;
     int compute_ready_low_cycles;
 
-    b8c_top #(
+    top #(
         .AXI_WIDTH(AXI_WIDTH),
         .PARALLELISM(PARALLELISM),
         .MODE_ID52(MODE_ID52),
+        .ID52_METADATA_FORMAT(ID52_METADATA_FORMAT),
         .SYMMETRIC_UPPER_ONLY(SYMMETRIC_UPPER_ONLY),
         .SIM_USE_MUL_IP(SIM_USE_MUL_IP),
         .SIM_USE_ADD_IP(SIM_USE_ADD_IP),
         .Y_QUEUE_DEPTH(Y_QUEUE_DEPTH),
         .Y_LIMITED_BYPASS_WINDOW(Y_LIMITED_BYPASS_WINDOW),
+        .Y_ISSUE_WINDOW(Y_ISSUE_WINDOW),
         .SIM_ENABLE_BANK_STATS(SIM_ENABLE_BANK_STATS),
         .SIM_PRINT_BATCH_BANK_STATS(SIM_PRINT_BATCH_BANK_STATS),
         .SIM_ENABLE_STALL_REASON_STATS(SIM_ENABLE_STALL_REASON_STATS),
+        .SIM_ENABLE_LAYER1_TRACE(SIM_ENABLE_LAYER1_TRACE),
         .LUT_INIT_FILE(LUT_FILE),
         .DECOUPLE_ID_META(DECOUPLE_ID_META),
         .ID_Q_DEPTH(ID_Q_DEPTH),
@@ -128,6 +136,9 @@ module tb_b8c_top_ram();
         if ((PARALLELISM % IO_LANES) != 0) begin
             $fatal(1, "PARALLELISM (%0d) must be multiple of IO_LANES (%0d)", PARALLELISM, IO_LANES);
         end
+        if ((ID52_METADATA_FORMAT != 1) && (ID52_METADATA_FORMAT != 2)) begin
+            $fatal(1, "Unsupported ID52_METADATA_FORMAT=%0d", ID52_METADATA_FORMAT);
+        end
         if (META_EMIT_BEATS <= 0) begin
             $fatal(1, "Invalid META_EMIT_BEATS=%0d", META_EMIT_BEATS);
         end
@@ -136,10 +147,10 @@ module tb_b8c_top_ram();
                    MAT_DATA_BEATS, META_EMIT_BEATS);
         end
 
-        $display("TB_CONFIG AXI_WIDTH=%0d PARALLELISM=%0d MODE_ID52=%0d SYMMETRIC_UPPER_ONLY=%0d SIM_USE_MUL_IP=%0d SIM_USE_ADD_IP=%0d",
-                 AXI_WIDTH, PARALLELISM, MODE_ID52, SYMMETRIC_UPPER_ONLY, SIM_USE_MUL_IP, SIM_USE_ADD_IP);
-        $display("TB_CONFIG Y_QUEUE_DEPTH=%0d Y_LIMITED_BYPASS_WINDOW=%0d ID_Q_DEPTH=%0d META_Q_DEPTH=%0d Y_ABS_TOL=%0.12e",
-                 Y_QUEUE_DEPTH, Y_LIMITED_BYPASS_WINDOW, ID_Q_DEPTH, META_Q_DEPTH, Y_ABS_TOL);
+        $display("TB_CONFIG AXI_WIDTH=%0d PARALLELISM=%0d MODE_ID52=%0d ID52_METADATA_FORMAT=%0d META_EMIT_BEATS=%0d META_PHYS_BATCH=%0d SYMMETRIC_UPPER_ONLY=%0d SIM_USE_MUL_IP=%0d SIM_USE_ADD_IP=%0d",
+                 AXI_WIDTH, PARALLELISM, MODE_ID52, ID52_METADATA_FORMAT, META_EMIT_BEATS, META_PHYS_BATCH, SYMMETRIC_UPPER_ONLY, SIM_USE_MUL_IP, SIM_USE_ADD_IP);
+        $display("TB_CONFIG Y_QUEUE_DEPTH=%0d Y_LIMITED_BYPASS_WINDOW=%0d Y_ISSUE_WINDOW=%0d ID_Q_DEPTH=%0d META_Q_DEPTH=%0d Y_ABS_TOL=%0.12e",
+                 Y_QUEUE_DEPTH, Y_LIMITED_BYPASS_WINDOW, Y_ISSUE_WINDOW, ID_Q_DEPTH, META_Q_DEPTH, Y_ABS_TOL);
         $display("TB_FILES X=%s", X_STREAM_FILE);
         $display("TB_FILES Y=%s", Y_STREAM_FILE);
         if (MODE_ID52) begin
@@ -219,6 +230,10 @@ module tb_b8c_top_ram();
         while (beat_count < Y_AXI_BEATS) begin
             @(posedge clk);
             if (m_axis_tvalid && m_axis_tready) begin
+                if (SIM_ENABLE_LAYER1_TRACE) begin
+                    $display("L1_TRACE event=writeback_valid_ready cycle=%0d lane=-1 bank=-1 valid=%0d ready=%0d fire=1 address=%0d queue_depth=0 source=tb_b8c_top_ram.m_axis calibrated=1 derived=0 gap=none",
+                             ($time / 10000), m_axis_tvalid, m_axis_tready, beat_count);
+                end
                 $display("Y[%0d] = %h %h %h %h %h %h %h %h", beat_count,
                     m_axis_tdata[64*7 +: 64], m_axis_tdata[64*6 +: 64],
                     m_axis_tdata[64*5 +: 64], m_axis_tdata[64*4 +: 64],
@@ -333,6 +348,10 @@ module tb_b8c_top_ram();
                     end else begin
                         compute_ready_low_cycles++;
                     end
+                    if (SIM_ENABLE_LAYER1_TRACE) begin
+                        $display("L1_TRACE event=input_handshake cycle=%0d lane=-1 bank=-1 valid=1 ready=%0d fire=%0d address=-1 queue_depth=-1 source=tb_b8c_top_ram.s_axis calibrated=1 derived=0 gap=none",
+                                 ($time / 10000), s_axis_tready, s_axis_tready);
+                    end
                 end
                 while (!s_axis_tready) begin
                     @(posedge clk);
@@ -342,6 +361,10 @@ module tb_b8c_top_ram();
                             compute_ready_high_cycles++;
                         end else begin
                             compute_ready_low_cycles++;
+                        end
+                        if (SIM_ENABLE_LAYER1_TRACE) begin
+                            $display("L1_TRACE event=input_handshake cycle=%0d lane=-1 bank=-1 valid=1 ready=%0d fire=%0d address=-1 queue_depth=-1 source=tb_b8c_top_ram.s_axis calibrated=1 derived=0 gap=none",
+                                     ($time / 10000), s_axis_tready, s_axis_tready);
                         end
                     end
                 end

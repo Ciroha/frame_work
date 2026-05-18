@@ -9,9 +9,11 @@ module y_acc_banks #(
     parameter ENABLE_PREVIEW_RESERVE = 1'b1,
     parameter QUEUE_DEPTH = 256,
     parameter LIMITED_BYPASS_WINDOW = 4,
+    parameter ISSUE_WINDOW = 4,
     parameter SIM_ENABLE_BANK_STATS = 1'b0,
     parameter SIM_PRINT_BATCH_BANK_STATS = 1'b0,
     parameter SIM_ENABLE_STALL_REASON_STATS = 1'b0,
+    parameter SIM_ENABLE_LAYER1_TRACE = 1'b0,
     parameter ENABLE_LIMITED_BYPASS = 1'b0
 )(
     input  wire clk,
@@ -42,6 +44,21 @@ module y_acc_banks #(
     localparam integer ADD_LATENCY = 8;
     localparam integer QUEUE_PTR_WIDTH = $clog2(QUEUE_DEPTH);
     localparam integer QUEUE_COUNT_WIDTH = $clog2(QUEUE_DEPTH + 1);
+    localparam integer ISSUE_PTR_WIDTH = (ISSUE_WINDOW <= 1) ? 1 : $clog2(ISSUE_WINDOW);
+    localparam integer OVERFLOW_DEPTH = (QUEUE_DEPTH > ISSUE_WINDOW) ? (QUEUE_DEPTH - ISSUE_WINDOW) : 1;
+    localparam integer OVERFLOW_PTR_WIDTH = (OVERFLOW_DEPTH <= 1) ? 1 : $clog2(OVERFLOW_DEPTH);
+
+    initial begin
+        if (ISSUE_WINDOW <= 0) begin
+            $fatal(1, "ISSUE_WINDOW (%0d) must be positive", ISSUE_WINDOW);
+        end
+        if (ISSUE_WINDOW > QUEUE_DEPTH) begin
+            $fatal(1, "ISSUE_WINDOW (%0d) must be <= QUEUE_DEPTH (%0d)", ISSUE_WINDOW, QUEUE_DEPTH);
+        end
+        if (ISSUE_WINDOW > LIMITED_BYPASS_WINDOW) begin
+            $fatal(1, "ISSUE_WINDOW (%0d) must be <= LIMITED_BYPASS_WINDOW (%0d)", ISSUE_WINDOW, LIMITED_BYPASS_WINDOW);
+        end
+    end
 
     reg [PARALLELISM*DATA_WIDTH-1:0] r_store_data;
     assign store_data = r_store_data;
@@ -98,8 +115,8 @@ module y_acc_banks #(
     integer                          merge_idx;
     integer                          merge_insert_idx;
     integer                          merge_preview_idx;
-    integer                          merge_pp_idx;
     integer                          merge_preview_match;
+    integer                          merge_pp_idx;
     integer                          merge_pp_match;
     integer                          stat_idx;
     integer                          stat_max_raw;
@@ -210,8 +227,7 @@ module y_acc_banks #(
                 end else begin
                     merged_pp_sum_real[merge_pp_match] =
                         merged_pp_sum_real[merge_pp_match] + $bitstoreal(pp[merge_idx]);
-                    merged_pp_data[merge_pp_match] =
-                        $realtobits(merged_pp_sum_real[merge_pp_match]);
+                    merged_pp_data[merge_pp_match] = $realtobits(merged_pp_sum_real[merge_pp_match]);
                 end
             end
         end
@@ -353,10 +369,10 @@ module y_acc_banks #(
                     end
                 end else if (mode == 2'b10) begin
                     for (lane_idx = 0; lane_idx < UPDATE_CHANNELS; lane_idx = lane_idx + 1) begin
-                        if (merged_pp_valid[lane_idx] && (merged_pp_addr[lane_idx] < DEPTH)) begin
-                            acc_value_real = y_real_mem[merged_pp_addr[lane_idx]] +
-                                             $bitstoreal(merged_pp_data[lane_idx]);
-                            y_real_mem[merged_pp_addr[lane_idx]] = acc_value_real;
+                        if (pp_valid_all[lane_idx] && (addr[lane_idx] < DEPTH)) begin
+                            acc_value_real = y_real_mem[addr[lane_idx]] +
+                                             $bitstoreal(pp[lane_idx]);
+                            y_real_mem[addr[lane_idx]] = acc_value_real;
                         end
                     end
                 end else if (mode == 2'b11) begin
@@ -386,11 +402,16 @@ module y_acc_banks #(
                 reg [BANK_ADDR_WIDTH-1:0] bank_addr_pipe [0:ADD_LATENCY-1];
                 reg [QUEUE_COUNT_WIDTH-1:0] bank_q_count;
                 reg [QUEUE_COUNT_WIDTH-1:0] bank_reserved_count;
-                reg [QUEUE_PTR_WIDTH-1:0] bank_q_head;
-                reg [QUEUE_PTR_WIDTH-1:0] bank_q_tail;
-                reg bank_q_valid [0:QUEUE_DEPTH-1];
-                reg [BANK_ADDR_WIDTH-1:0] bank_q_addr [0:QUEUE_DEPTH-1];
-                reg [DATA_WIDTH-1:0] bank_q_data [0:QUEUE_DEPTH-1];
+                reg [QUEUE_COUNT_WIDTH-1:0] bank_win_count;
+                reg [QUEUE_COUNT_WIDTH-1:0] bank_overflow_count;
+                reg [OVERFLOW_PTR_WIDTH-1:0] bank_overflow_head;
+                reg [OVERFLOW_PTR_WIDTH-1:0] bank_overflow_tail;
+                reg bank_win_valid [0:ISSUE_WINDOW-1];
+                reg [BANK_ADDR_WIDTH-1:0] bank_win_addr [0:ISSUE_WINDOW-1];
+                reg [DATA_WIDTH-1:0] bank_win_data [0:ISSUE_WINDOW-1];
+                reg bank_overflow_valid [0:OVERFLOW_DEPTH-1];
+                reg [BANK_ADDR_WIDTH-1:0] bank_overflow_addr [0:OVERFLOW_DEPTH-1];
+                reg [DATA_WIDTH-1:0] bank_overflow_data [0:OVERFLOW_DEPTH-1];
 
                 integer init_idx;
                 integer pipe_idx;
@@ -405,15 +426,17 @@ module y_acc_banks #(
                 reg bank_head_conflict;
                 reg [BANK_ADDR_WIDTH-1:0] bank_issue_addr;
                 reg [DATA_WIDTH-1:0] bank_issue_data;
-                reg [QUEUE_PTR_WIDTH-1:0] bank_issue_slot;
+                reg [ISSUE_PTR_WIDTH-1:0] bank_issue_slot;
                 reg bank_ready;
                 reg bank_idle;
                 reg bank_window_has_candidate;
-                reg [QUEUE_PTR_WIDTH-1:0] q_head_next;
-                reg [QUEUE_PTR_WIDTH-1:0] q_tail_next;
                 reg [QUEUE_COUNT_WIDTH-1:0] q_count_next;
                 reg [QUEUE_COUNT_WIDTH-1:0] q_reserved_next;
-                reg [QUEUE_PTR_WIDTH-1:0] enq_ptr;
+                reg [QUEUE_COUNT_WIDTH-1:0] win_count_next;
+                reg [QUEUE_COUNT_WIDTH-1:0] overflow_count_next;
+                reg [OVERFLOW_PTR_WIDTH-1:0] overflow_head_next;
+                reg [OVERFLOW_PTR_WIDTH-1:0] overflow_tail_next;
+                reg [OVERFLOW_PTR_WIDTH-1:0] overflow_push_ptr;
                 integer issue_sel_idx;
                 integer shift_idx;
                 integer issue_limit;
@@ -436,6 +459,11 @@ module y_acc_banks #(
                 wire [4:0] bank_status;
                 wire bank_result_valid;
                 wire unused_status;
+                wire bank_load_fire;
+                wire bank_result_write_fire;
+                wire bank_ram_we;
+                wire [BANK_ADDR_WIDTH-1:0] bank_ram_waddr;
+                wire [DATA_WIDTH-1:0] bank_ram_wdata;
 
                 assign acc_ready_vec[bank_idx] = bank_ready;
                 assign acc_idle_vec[bank_idx] = bank_idle;
@@ -446,35 +474,38 @@ module y_acc_banks #(
 
                     bank_issue_fire = 1'b0;
                     bank_head_conflict = 1'b0;
-                    bank_issue_slot = {QUEUE_PTR_WIDTH{1'b0}};
-                    bank_issue_addr = bank_q_addr[0];
-                    bank_issue_data = bank_q_data[0];
+                    bank_issue_slot = {ISSUE_PTR_WIDTH{1'b0}};
+                    bank_issue_addr = bank_win_addr[0];
+                    bank_issue_data = bank_win_data[0];
                     bank_window_has_candidate = 1'b0;
 
                     if (mode == 2'b10) begin
                         issue_limit = 0;
-                        if (bank_q_count != 0) begin
+                        if (bank_win_count != 0) begin
                             if (ENABLE_LIMITED_BYPASS) begin
-                                issue_limit = (bank_q_count < LIMITED_BYPASS_WINDOW) ? bank_q_count : LIMITED_BYPASS_WINDOW;
+                                issue_limit = (bank_win_count < LIMITED_BYPASS_WINDOW) ? bank_win_count : LIMITED_BYPASS_WINDOW;
+                                if (issue_limit > ISSUE_WINDOW) begin
+                                    issue_limit = ISSUE_WINDOW;
+                                end
                             end else begin
                                 issue_limit = 1;
                             end
                         end
 
-                        for (issue_sel_idx = 0; issue_sel_idx < issue_limit; issue_sel_idx = issue_sel_idx + 1) begin
+                        for (issue_sel_idx = 0; issue_sel_idx < ISSUE_WINDOW; issue_sel_idx = issue_sel_idx + 1) begin
                             bank_head_conflict = 1'b0;
-                            if (bank_q_valid[issue_sel_idx]) begin
+                            if ((issue_sel_idx < issue_limit) && bank_win_valid[issue_sel_idx]) begin
                                 bank_window_has_candidate = 1'b1;
                                 for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
-                                    if (bank_valid_pipe[pipe_idx] && (bank_addr_pipe[pipe_idx] == bank_q_addr[issue_sel_idx])) begin
+                                    if (bank_valid_pipe[pipe_idx] && (bank_addr_pipe[pipe_idx] == bank_win_addr[issue_sel_idx])) begin
                                         bank_head_conflict = 1'b1;
                                     end
                                 end
                                 if (!bank_issue_fire && !bank_head_conflict) begin
                                     bank_issue_fire = 1'b1;
-                                    bank_issue_slot = issue_sel_idx[QUEUE_PTR_WIDTH-1:0];
-                                    bank_issue_addr = bank_q_addr[issue_sel_idx];
-                                    bank_issue_data = bank_q_data[issue_sel_idx];
+                                    bank_issue_slot = issue_sel_idx[ISSUE_PTR_WIDTH-1:0];
+                                    bank_issue_addr = bank_win_addr[issue_sel_idx];
+                                    bank_issue_data = bank_win_data[issue_sel_idx];
                                 end
                             end
                         end
@@ -499,6 +530,11 @@ module y_acc_banks #(
 
                 assign bank_old_data = bank_ram[bank_issue_addr];
                 assign unused_status = &{1'b0, bank_status};
+                assign bank_load_fire = (mode == 2'b01) && ls_en && bank_in_range && (ls_addr < BANK_DEPTH);
+                assign bank_result_write_fire = (mode == 2'b10) && bank_result_valid;
+                assign bank_ram_we = bank_load_fire || bank_result_write_fire;
+                assign bank_ram_waddr = bank_load_fire ? bank_ls_addr : bank_addr_pipe[ADD_LATENCY-1];
+                assign bank_ram_wdata = bank_load_fire ? load_data[bank_idx*DATA_WIDTH +: DATA_WIDTH] : bank_new_data;
 
                 fp64_add_xilinx_wrapper #(
                     .LATENCY(ADD_LATENCY)
@@ -521,8 +557,10 @@ module y_acc_banks #(
                     end
                     bank_q_count = {QUEUE_COUNT_WIDTH{1'b0}};
                     bank_reserved_count = {QUEUE_COUNT_WIDTH{1'b0}};
-                    bank_q_head = {QUEUE_PTR_WIDTH{1'b0}};
-                    bank_q_tail = {QUEUE_PTR_WIDTH{1'b0}};
+                    bank_win_count = {QUEUE_COUNT_WIDTH{1'b0}};
+                    bank_overflow_count = {QUEUE_COUNT_WIDTH{1'b0}};
+                    bank_overflow_head = {OVERFLOW_PTR_WIDTH{1'b0}};
+                    bank_overflow_tail = {OVERFLOW_PTR_WIDTH{1'b0}};
                     stat_ready_block_count = 0;
                     stat_ready_block_deficit_sum = 0;
                     stat_preview_reject_count = 0;
@@ -533,16 +571,21 @@ module y_acc_banks #(
                     stat_issue_bypass_pick_count = 0;
                     stat_issue_conflict_block_count = 0;
                     stat_stall_dumped_local = 1'b0;
-                    for (init_idx = 0; init_idx < QUEUE_DEPTH; init_idx = init_idx + 1) begin
-                        bank_q_valid[init_idx] = 1'b0;
-                        bank_q_addr[init_idx] = {BANK_ADDR_WIDTH{1'b0}};
-                        bank_q_data[init_idx] = {DATA_WIDTH{1'b0}};
+                    for (init_idx = 0; init_idx < ISSUE_WINDOW; init_idx = init_idx + 1) begin
+                        bank_win_valid[init_idx] = 1'b0;
+                        bank_win_addr[init_idx] = {BANK_ADDR_WIDTH{1'b0}};
+                        bank_win_data[init_idx] = {DATA_WIDTH{1'b0}};
+                    end
+                    for (init_idx = 0; init_idx < OVERFLOW_DEPTH; init_idx = init_idx + 1) begin
+                        bank_overflow_valid[init_idx] = 1'b0;
+                        bank_overflow_addr[init_idx] = {BANK_ADDR_WIDTH{1'b0}};
+                        bank_overflow_data[init_idx] = {DATA_WIDTH{1'b0}};
                     end
                 end
 
                 always @(posedge clk) begin
-                    if ((mode == 2'b01) && ls_en && bank_in_range && (ls_addr < BANK_DEPTH)) begin
-                        bank_ram[bank_ls_addr] <= load_data[bank_idx*DATA_WIDTH +: DATA_WIDTH];
+                    if (bank_ram_we) begin
+                        bank_ram[bank_ram_waddr] <= bank_ram_wdata;
                     end
 
                     if ((mode == 2'b11) && ls_en) begin
@@ -556,22 +599,31 @@ module y_acc_banks #(
                     if (mode != 2'b10) begin
                         bank_q_count <= {QUEUE_COUNT_WIDTH{1'b0}};
                         bank_reserved_count <= {QUEUE_COUNT_WIDTH{1'b0}};
-                        bank_q_head <= {QUEUE_PTR_WIDTH{1'b0}};
-                        bank_q_tail <= {QUEUE_PTR_WIDTH{1'b0}};
+                        bank_win_count <= {QUEUE_COUNT_WIDTH{1'b0}};
+                        bank_overflow_count <= {QUEUE_COUNT_WIDTH{1'b0}};
+                        bank_overflow_head <= {OVERFLOW_PTR_WIDTH{1'b0}};
+                        bank_overflow_tail <= {OVERFLOW_PTR_WIDTH{1'b0}};
                         for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
                             bank_valid_pipe[pipe_idx] <= 1'b0;
                             bank_addr_pipe[pipe_idx] <= {BANK_ADDR_WIDTH{1'b0}};
                         end
-                        for (pipe_idx = 0; pipe_idx < QUEUE_DEPTH; pipe_idx = pipe_idx + 1) begin
-                            bank_q_valid[pipe_idx] <= 1'b0;
-                            bank_q_addr[pipe_idx] <= {BANK_ADDR_WIDTH{1'b0}};
-                            bank_q_data[pipe_idx] <= {DATA_WIDTH{1'b0}};
+                        for (pipe_idx = 0; pipe_idx < ISSUE_WINDOW; pipe_idx = pipe_idx + 1) begin
+                            bank_win_valid[pipe_idx] <= 1'b0;
+                            bank_win_addr[pipe_idx] <= {BANK_ADDR_WIDTH{1'b0}};
+                            bank_win_data[pipe_idx] <= {DATA_WIDTH{1'b0}};
+                        end
+                        for (pipe_idx = 0; pipe_idx < OVERFLOW_DEPTH; pipe_idx = pipe_idx + 1) begin
+                            bank_overflow_valid[pipe_idx] <= 1'b0;
+                            bank_overflow_addr[pipe_idx] <= {BANK_ADDR_WIDTH{1'b0}};
+                            bank_overflow_data[pipe_idx] <= {DATA_WIDTH{1'b0}};
                         end
                     end else begin
-                        q_head_next = bank_q_head;
-                        q_tail_next = bank_q_tail;
                         q_count_next = bank_q_count;
                         q_reserved_next = bank_reserved_count;
+                        win_count_next = bank_win_count;
+                        overflow_count_next = bank_overflow_count;
+                        overflow_head_next = bank_overflow_head;
+                        overflow_tail_next = bank_overflow_tail;
 
                         if (ENABLE_PREVIEW_RESERVE && batch_fire && acc_ready) begin
                             q_reserved_next = q_reserved_next + preview_bank_hit_count[QUEUE_COUNT_WIDTH-1:0];
@@ -583,33 +635,61 @@ module y_acc_banks #(
                         end
                         bank_valid_pipe[0] <= bank_issue_fire;
                         bank_addr_pipe[0] <= bank_issue_fire ? bank_issue_addr : {BANK_ADDR_WIDTH{1'b0}};
+                        if (SIM_ENABLE_LAYER1_TRACE && bank_issue_fire) begin
+                            $display("L1_TRACE event=y_issue cycle=%0d lane=-1 bank=%0d valid=1 ready=1 fire=1 address=%0d queue_depth=%0d source=y_acc_banks.issue calibrated=1 derived=0 gap=none",
+                                     ($time / 10000), bank_idx, bank_issue_addr, bank_q_count);
+                        end
+                        if (SIM_ENABLE_LAYER1_TRACE && bank_result_valid) begin
+                            $display("L1_TRACE event=add_retire cycle=%0d lane=-1 bank=%0d valid=1 ready=1 fire=1 address=%0d queue_depth=%0d source=y_acc_banks.add_retire calibrated=1 derived=0 gap=none",
+                                     ($time / 10000), bank_idx, bank_addr_pipe[ADD_LATENCY-1], bank_q_count);
+                        end
 
                         if (bank_issue_fire) begin
-                            for (shift_idx = 0; shift_idx < QUEUE_DEPTH-1; shift_idx = shift_idx + 1) begin
-                                if (shift_idx >= bank_issue_slot) begin
-                                    if (shift_idx < (bank_q_count - 1)) begin
-                                        bank_q_valid[shift_idx] <= bank_q_valid[shift_idx+1];
-                                        bank_q_addr[shift_idx] <= bank_q_addr[shift_idx+1];
-                                        bank_q_data[shift_idx] <= bank_q_data[shift_idx+1];
-                                    end else if (shift_idx == (bank_q_count - 1)) begin
-                                        bank_q_valid[shift_idx] <= 1'b0;
-                                        bank_q_addr[shift_idx] <= {BANK_ADDR_WIDTH{1'b0}};
-                                        bank_q_data[shift_idx] <= {DATA_WIDTH{1'b0}};
-                                    end
+                            for (shift_idx = 0; shift_idx < ISSUE_WINDOW-1; shift_idx = shift_idx + 1) begin
+                                if ((shift_idx >= bank_issue_slot) && (shift_idx < (bank_win_count - 1))) begin
+                                    bank_win_valid[shift_idx] <= bank_win_valid[shift_idx+1];
+                                    bank_win_addr[shift_idx] <= bank_win_addr[shift_idx+1];
+                                    bank_win_data[shift_idx] <= bank_win_data[shift_idx+1];
                                 end
                             end
                             q_count_next = q_count_next - 1'b1;
+                            win_count_next = win_count_next - 1'b1;
+                            if (overflow_count_next != 0) begin
+                                bank_win_valid[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= bank_overflow_valid[overflow_head_next];
+                                bank_win_addr[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= bank_overflow_addr[overflow_head_next];
+                                bank_win_data[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= bank_overflow_data[overflow_head_next];
+                                bank_overflow_valid[overflow_head_next] <= 1'b0;
+                                overflow_head_next = (overflow_head_next == (OVERFLOW_DEPTH - 1)) ? {OVERFLOW_PTR_WIDTH{1'b0}} : overflow_head_next + 1'b1;
+                                overflow_count_next = overflow_count_next - 1'b1;
+                                win_count_next = win_count_next + 1'b1;
+                            end else begin
+                                bank_win_valid[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= 1'b0;
+                                bank_win_addr[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= {BANK_ADDR_WIDTH{1'b0}};
+                                bank_win_data[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= {DATA_WIDTH{1'b0}};
+                            end
                         end
 
                         if (merged_enqueue_fire && (!ENABLE_PREVIEW_RESERVE ? acc_ready_vec[bank_idx] : 1'b1)) begin
-                            enq_ptr = q_count_next[QUEUE_PTR_WIDTH-1:0];
                             for (enqueue_idx = 0; enqueue_idx < UPDATE_CHANNELS; enqueue_idx = enqueue_idx + 1) begin
                                 if (merged_pp_valid[enqueue_idx] &&
                                     (merged_pp_bank[enqueue_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
-                                    bank_q_valid[enq_ptr] <= 1'b1;
-                                    bank_q_addr[enq_ptr] <= merged_pp_bank_addr[enqueue_idx];
-                                    bank_q_data[enq_ptr] <= merged_pp_data[enqueue_idx];
-                                    enq_ptr = enq_ptr + 1'b1;
+                                    if (SIM_ENABLE_LAYER1_TRACE) begin
+                                        $display("L1_TRACE event=y_enqueue cycle=%0d lane=%0d bank=%0d valid=1 ready=1 fire=1 address=%0d queue_depth=%0d source=y_acc_banks.enqueue calibrated=1 derived=0 gap=none",
+                                                 ($time / 10000), enqueue_idx, bank_idx, merged_pp_addr[enqueue_idx], q_count_next);
+                                    end
+                                    if (win_count_next < ISSUE_WINDOW) begin
+                                        bank_win_valid[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= 1'b1;
+                                        bank_win_addr[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= merged_pp_bank_addr[enqueue_idx];
+                                        bank_win_data[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= merged_pp_data[enqueue_idx];
+                                        win_count_next = win_count_next + 1'b1;
+                                    end else begin
+                                        overflow_push_ptr = overflow_tail_next;
+                                        bank_overflow_valid[overflow_push_ptr] <= 1'b1;
+                                        bank_overflow_addr[overflow_push_ptr] <= merged_pp_bank_addr[enqueue_idx];
+                                        bank_overflow_data[overflow_push_ptr] <= merged_pp_data[enqueue_idx];
+                                        overflow_tail_next = (overflow_tail_next == (OVERFLOW_DEPTH - 1)) ? {OVERFLOW_PTR_WIDTH{1'b0}} : overflow_tail_next + 1'b1;
+                                        overflow_count_next = overflow_count_next + 1'b1;
+                                    end
                                     q_count_next = q_count_next + 1'b1;
                                 end
                             end
@@ -618,10 +698,12 @@ module y_acc_banks #(
                             end
                         end
 
-                        bank_q_head <= {QUEUE_PTR_WIDTH{1'b0}};
-                        bank_q_tail <= q_count_next[QUEUE_PTR_WIDTH-1:0];
                         bank_q_count <= q_count_next;
                         bank_reserved_count <= q_reserved_next;
+                        bank_win_count <= win_count_next;
+                        bank_overflow_count <= overflow_count_next;
+                        bank_overflow_head <= overflow_head_next;
+                        bank_overflow_tail <= overflow_tail_next;
 
                         if (q_count_next > stat_queue_high_watermark) begin
                             stat_queue_high_watermark <= q_count_next;
@@ -649,9 +731,6 @@ module y_acc_banks #(
                             stat_issue_conflict_block_count <= stat_issue_conflict_block_count + 1;
                         end
 
-                        if (bank_result_valid) begin
-                            bank_ram[bank_addr_pipe[ADD_LATENCY-1]] <= bank_new_data;
-                        end
                     end
 
                     if ((mode == 2'b11) && ls_en && !stat_stall_dumped_local) begin
@@ -687,17 +766,24 @@ module y_acc_banks #(
             reg bank_valid_pipe [0:ADD_LATENCY-1];
             reg [BANK_ADDR_WIDTH-1:0] bank_addr_pipe [0:ADD_LATENCY-1];
             reg [QUEUE_COUNT_WIDTH-1:0] bank_q_count;
-            reg [QUEUE_PTR_WIDTH-1:0] bank_q_head;
-            reg [QUEUE_PTR_WIDTH-1:0] bank_q_tail;
-            reg bank_q_valid [0:QUEUE_DEPTH-1];
-            reg [BANK_ADDR_WIDTH-1:0] bank_q_addr [0:QUEUE_DEPTH-1];
-            reg [DATA_WIDTH-1:0] bank_q_data [0:QUEUE_DEPTH-1];
+            reg [QUEUE_COUNT_WIDTH-1:0] bank_reserved_count;
+            reg [QUEUE_COUNT_WIDTH-1:0] bank_win_count;
+            reg [QUEUE_COUNT_WIDTH-1:0] bank_overflow_count;
+            reg [OVERFLOW_PTR_WIDTH-1:0] bank_overflow_head;
+            reg [OVERFLOW_PTR_WIDTH-1:0] bank_overflow_tail;
+            reg bank_win_valid [0:ISSUE_WINDOW-1];
+            reg [BANK_ADDR_WIDTH-1:0] bank_win_addr [0:ISSUE_WINDOW-1];
+            reg [DATA_WIDTH-1:0] bank_win_data [0:ISSUE_WINDOW-1];
+            reg bank_overflow_valid [0:OVERFLOW_DEPTH-1];
+            reg [BANK_ADDR_WIDTH-1:0] bank_overflow_addr [0:OVERFLOW_DEPTH-1];
+            reg [DATA_WIDTH-1:0] bank_overflow_data [0:OVERFLOW_DEPTH-1];
 
             integer init_idx;
             integer pipe_idx;
             integer hit_idx;
             integer enqueue_idx;
             integer bank_hit_count;
+            integer preview_bank_hit_count;
             integer queue_space;
             integer issue_release_credit;
 
@@ -705,13 +791,16 @@ module y_acc_banks #(
             reg bank_head_conflict;
             reg [BANK_ADDR_WIDTH-1:0] bank_issue_addr;
             reg [DATA_WIDTH-1:0] bank_issue_data;
-            reg [QUEUE_PTR_WIDTH-1:0] bank_issue_slot;
+            reg [ISSUE_PTR_WIDTH-1:0] bank_issue_slot;
             reg bank_ready;
             reg bank_idle;
-            reg [QUEUE_PTR_WIDTH-1:0] q_head_next;
-            reg [QUEUE_PTR_WIDTH-1:0] q_tail_next;
             reg [QUEUE_COUNT_WIDTH-1:0] q_count_next;
-            reg [QUEUE_PTR_WIDTH-1:0] enq_ptr;
+            reg [QUEUE_COUNT_WIDTH-1:0] q_reserved_next;
+            reg [QUEUE_COUNT_WIDTH-1:0] win_count_next;
+            reg [QUEUE_COUNT_WIDTH-1:0] overflow_count_next;
+            reg [OVERFLOW_PTR_WIDTH-1:0] overflow_head_next;
+            reg [OVERFLOW_PTR_WIDTH-1:0] overflow_tail_next;
+            reg [OVERFLOW_PTR_WIDTH-1:0] overflow_push_ptr;
             integer issue_sel_idx;
             integer shift_idx;
             integer issue_limit;
@@ -724,58 +813,78 @@ module y_acc_banks #(
             wire [4:0] bank_status;
             wire bank_result_valid;
             wire unused_status;
+            wire bank_load_fire;
+            wire bank_result_write_fire;
+            wire bank_ram_we;
+            wire [BANK_ADDR_WIDTH-1:0] bank_ram_waddr;
+            wire [DATA_WIDTH-1:0] bank_ram_wdata;
 
                 assign acc_ready_vec[bank_idx] = bank_ready;
                 assign acc_idle_vec[bank_idx] = bank_idle;
 
                 always @(*) begin
                     bank_hit_count = 0;
+                    preview_bank_hit_count = 0;
                     for (hit_idx = 0; hit_idx < UPDATE_CHANNELS; hit_idx = hit_idx + 1) begin
                         if (pp_valid_all[hit_idx] &&
                             (addr[hit_idx] < DEPTH) &&
                             (bank_sel[hit_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
                             bank_hit_count = bank_hit_count + 1;
                         end
+                        if (preview_valid_all[hit_idx] &&
+                            (preview_addr[hit_idx] < DEPTH) &&
+                            (preview_bank_sel[hit_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
+                            preview_bank_hit_count = preview_bank_hit_count + 1;
+                        end
                     end
 
                     bank_issue_fire = 1'b0;
                     bank_head_conflict = 1'b0;
-                    bank_issue_slot = {QUEUE_PTR_WIDTH{1'b0}};
-                    bank_issue_addr = bank_q_addr[0];
-                    bank_issue_data = bank_q_data[0];
+                    bank_issue_slot = {ISSUE_PTR_WIDTH{1'b0}};
+                    bank_issue_addr = bank_win_addr[0];
+                    bank_issue_data = bank_win_data[0];
 
                     if (mode == 2'b10) begin
                         issue_limit = 0;
-                        if (bank_q_count != 0) begin
+                        if (bank_win_count != 0) begin
                             if (ENABLE_LIMITED_BYPASS) begin
-                                issue_limit = (bank_q_count < LIMITED_BYPASS_WINDOW) ? bank_q_count : LIMITED_BYPASS_WINDOW;
+                                issue_limit = (bank_win_count < LIMITED_BYPASS_WINDOW) ? bank_win_count : LIMITED_BYPASS_WINDOW;
+                                if (issue_limit > ISSUE_WINDOW) begin
+                                    issue_limit = ISSUE_WINDOW;
+                                end
                             end else begin
                                 issue_limit = 1;
                             end
                         end
 
-                        for (issue_sel_idx = 0; issue_sel_idx < QUEUE_DEPTH; issue_sel_idx = issue_sel_idx + 1) begin
+                        for (issue_sel_idx = 0; issue_sel_idx < ISSUE_WINDOW; issue_sel_idx = issue_sel_idx + 1) begin
                             bank_head_conflict = 1'b0;
-                            if ((issue_sel_idx < issue_limit) && bank_q_valid[issue_sel_idx]) begin
+                            if ((issue_sel_idx < issue_limit) && bank_win_valid[issue_sel_idx]) begin
                                 for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
-                                    if (bank_valid_pipe[pipe_idx] && (bank_addr_pipe[pipe_idx] == bank_q_addr[issue_sel_idx])) begin
+                                    if (bank_valid_pipe[pipe_idx] && (bank_addr_pipe[pipe_idx] == bank_win_addr[issue_sel_idx])) begin
                                         bank_head_conflict = 1'b1;
                                     end
                                 end
                                 if (!bank_issue_fire && !bank_head_conflict) begin
                                     bank_issue_fire = 1'b1;
-                                    bank_issue_slot = issue_sel_idx[QUEUE_PTR_WIDTH-1:0];
-                                    bank_issue_addr = bank_q_addr[issue_sel_idx];
-                                    bank_issue_data = bank_q_data[issue_sel_idx];
+                                    bank_issue_slot = issue_sel_idx[ISSUE_PTR_WIDTH-1:0];
+                                    bank_issue_addr = bank_win_addr[issue_sel_idx];
+                                    bank_issue_data = bank_win_data[issue_sel_idx];
                                 end
                             end
                         end
                     end
 
                     issue_release_credit = ((mode == 2'b10) && bank_issue_fire) ? 1 : 0;
-                    queue_space = QUEUE_DEPTH - bank_q_count + issue_release_credit;
-                    bank_ready = (queue_space >= bank_hit_count);
-                    bank_idle = (bank_q_count == 0);
+                    if (ENABLE_PREVIEW_RESERVE) begin
+                        queue_space = QUEUE_DEPTH - bank_q_count - bank_reserved_count + issue_release_credit;
+                        bank_ready = (queue_space >= preview_bank_hit_count);
+                        bank_idle = (bank_q_count == 0) && (bank_reserved_count == 0);
+                    end else begin
+                        queue_space = QUEUE_DEPTH - bank_q_count + issue_release_credit;
+                        bank_ready = (queue_space >= bank_hit_count);
+                        bank_idle = (bank_q_count == 0);
+                    end
                     for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
                         if (bank_valid_pipe[pipe_idx]) begin
                             bank_idle = 1'b0;
@@ -785,6 +894,11 @@ module y_acc_banks #(
 
             assign bank_old_data = bank_ram[bank_issue_addr];
             assign unused_status = &{1'b0, bank_status};
+            assign bank_load_fire = (mode == 2'b01) && ls_en && bank_in_range && (ls_addr < BANK_DEPTH);
+            assign bank_result_write_fire = (mode == 2'b10) && bank_result_valid;
+            assign bank_ram_we = bank_load_fire || bank_result_write_fire;
+            assign bank_ram_waddr = bank_load_fire ? bank_ls_addr : bank_addr_pipe[ADD_LATENCY-1];
+            assign bank_ram_wdata = bank_load_fire ? load_data[bank_idx*DATA_WIDTH +: DATA_WIDTH] : bank_new_data;
 
             fp64_add_xilinx_wrapper #(
                 .LATENCY(ADD_LATENCY)
@@ -806,18 +920,26 @@ module y_acc_banks #(
                     bank_addr_pipe[init_idx] = {BANK_ADDR_WIDTH{1'b0}};
                 end
                 bank_q_count = {QUEUE_COUNT_WIDTH{1'b0}};
-                bank_q_head = {QUEUE_PTR_WIDTH{1'b0}};
-                bank_q_tail = {QUEUE_PTR_WIDTH{1'b0}};
-                for (init_idx = 0; init_idx < QUEUE_DEPTH; init_idx = init_idx + 1) begin
-                    bank_q_valid[init_idx] = 1'b0;
-                    bank_q_addr[init_idx] = {BANK_ADDR_WIDTH{1'b0}};
-                    bank_q_data[init_idx] = {DATA_WIDTH{1'b0}};
+                bank_reserved_count = {QUEUE_COUNT_WIDTH{1'b0}};
+                bank_win_count = {QUEUE_COUNT_WIDTH{1'b0}};
+                bank_overflow_count = {QUEUE_COUNT_WIDTH{1'b0}};
+                bank_overflow_head = {OVERFLOW_PTR_WIDTH{1'b0}};
+                bank_overflow_tail = {OVERFLOW_PTR_WIDTH{1'b0}};
+                for (init_idx = 0; init_idx < ISSUE_WINDOW; init_idx = init_idx + 1) begin
+                    bank_win_valid[init_idx] = 1'b0;
+                    bank_win_addr[init_idx] = {BANK_ADDR_WIDTH{1'b0}};
+                    bank_win_data[init_idx] = {DATA_WIDTH{1'b0}};
+                end
+                for (init_idx = 0; init_idx < OVERFLOW_DEPTH; init_idx = init_idx + 1) begin
+                    bank_overflow_valid[init_idx] = 1'b0;
+                    bank_overflow_addr[init_idx] = {BANK_ADDR_WIDTH{1'b0}};
+                    bank_overflow_data[init_idx] = {DATA_WIDTH{1'b0}};
                 end
             end
 
             always @(posedge clk) begin
-                if ((mode == 2'b01) && ls_en && bank_in_range && (ls_addr < BANK_DEPTH)) begin
-                    bank_ram[bank_ls_addr] <= load_data[bank_idx*DATA_WIDTH +: DATA_WIDTH];
+                if (bank_ram_we) begin
+                    bank_ram[bank_ram_waddr] <= bank_ram_wdata;
                 end
 
                 if ((mode == 2'b11) && ls_en) begin
@@ -830,21 +952,36 @@ module y_acc_banks #(
 
                 if (mode != 2'b10) begin
                     bank_q_count <= {QUEUE_COUNT_WIDTH{1'b0}};
-                    bank_q_head <= {QUEUE_PTR_WIDTH{1'b0}};
-                    bank_q_tail <= {QUEUE_PTR_WIDTH{1'b0}};
+                    bank_reserved_count <= {QUEUE_COUNT_WIDTH{1'b0}};
+                    bank_win_count <= {QUEUE_COUNT_WIDTH{1'b0}};
+                    bank_overflow_count <= {QUEUE_COUNT_WIDTH{1'b0}};
+                    bank_overflow_head <= {OVERFLOW_PTR_WIDTH{1'b0}};
+                    bank_overflow_tail <= {OVERFLOW_PTR_WIDTH{1'b0}};
                     for (pipe_idx = 0; pipe_idx < ADD_LATENCY; pipe_idx = pipe_idx + 1) begin
                         bank_valid_pipe[pipe_idx] <= 1'b0;
                         bank_addr_pipe[pipe_idx] <= {BANK_ADDR_WIDTH{1'b0}};
                     end
-                    for (pipe_idx = 0; pipe_idx < QUEUE_DEPTH; pipe_idx = pipe_idx + 1) begin
-                        bank_q_valid[pipe_idx] <= 1'b0;
-                        bank_q_addr[pipe_idx] <= {BANK_ADDR_WIDTH{1'b0}};
-                        bank_q_data[pipe_idx] <= {DATA_WIDTH{1'b0}};
+                    for (pipe_idx = 0; pipe_idx < ISSUE_WINDOW; pipe_idx = pipe_idx + 1) begin
+                        bank_win_valid[pipe_idx] <= 1'b0;
+                        bank_win_addr[pipe_idx] <= {BANK_ADDR_WIDTH{1'b0}};
+                        bank_win_data[pipe_idx] <= {DATA_WIDTH{1'b0}};
+                    end
+                    for (pipe_idx = 0; pipe_idx < OVERFLOW_DEPTH; pipe_idx = pipe_idx + 1) begin
+                        bank_overflow_valid[pipe_idx] <= 1'b0;
+                        bank_overflow_addr[pipe_idx] <= {BANK_ADDR_WIDTH{1'b0}};
+                        bank_overflow_data[pipe_idx] <= {DATA_WIDTH{1'b0}};
                     end
                 end else begin
-                    q_head_next = bank_q_head;
-                    q_tail_next = bank_q_tail;
                     q_count_next = bank_q_count;
+                    q_reserved_next = bank_reserved_count;
+                    win_count_next = bank_win_count;
+                    overflow_count_next = bank_overflow_count;
+                    overflow_head_next = bank_overflow_head;
+                    overflow_tail_next = bank_overflow_tail;
+
+                    if (ENABLE_PREVIEW_RESERVE && batch_fire && acc_ready) begin
+                        q_reserved_next = q_reserved_next + preview_bank_hit_count[QUEUE_COUNT_WIDTH-1:0];
+                    end
 
                     for (pipe_idx = ADD_LATENCY-1; pipe_idx > 0; pipe_idx = pipe_idx - 1) begin
                         bank_valid_pipe[pipe_idx] <= bank_valid_pipe[pipe_idx-1];
@@ -854,44 +991,63 @@ module y_acc_banks #(
                     bank_addr_pipe[0] <= bank_issue_fire ? bank_issue_addr : {BANK_ADDR_WIDTH{1'b0}};
 
                     if (bank_issue_fire) begin
-                        for (shift_idx = 0; shift_idx < QUEUE_DEPTH-1; shift_idx = shift_idx + 1) begin
-                            if (shift_idx >= bank_issue_slot) begin
-                                if (shift_idx < (bank_q_count - 1)) begin
-                                    bank_q_valid[shift_idx] <= bank_q_valid[shift_idx+1];
-                                    bank_q_addr[shift_idx] <= bank_q_addr[shift_idx+1];
-                                    bank_q_data[shift_idx] <= bank_q_data[shift_idx+1];
-                                end else if (shift_idx == (bank_q_count - 1)) begin
-                                    bank_q_valid[shift_idx] <= 1'b0;
-                                    bank_q_addr[shift_idx] <= {BANK_ADDR_WIDTH{1'b0}};
-                                    bank_q_data[shift_idx] <= {DATA_WIDTH{1'b0}};
-                                end
+                        for (shift_idx = 0; shift_idx < ISSUE_WINDOW-1; shift_idx = shift_idx + 1) begin
+                            if ((shift_idx >= bank_issue_slot) && (shift_idx < (bank_win_count - 1))) begin
+                                bank_win_valid[shift_idx] <= bank_win_valid[shift_idx+1];
+                                bank_win_addr[shift_idx] <= bank_win_addr[shift_idx+1];
+                                bank_win_data[shift_idx] <= bank_win_data[shift_idx+1];
                             end
                         end
                         q_count_next = q_count_next - 1'b1;
+                        win_count_next = win_count_next - 1'b1;
+                        if (overflow_count_next != 0) begin
+                            bank_win_valid[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= bank_overflow_valid[overflow_head_next];
+                            bank_win_addr[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= bank_overflow_addr[overflow_head_next];
+                            bank_win_data[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= bank_overflow_data[overflow_head_next];
+                            bank_overflow_valid[overflow_head_next] <= 1'b0;
+                            overflow_head_next = (overflow_head_next == (OVERFLOW_DEPTH - 1)) ? {OVERFLOW_PTR_WIDTH{1'b0}} : overflow_head_next + 1'b1;
+                            overflow_count_next = overflow_count_next - 1'b1;
+                            win_count_next = win_count_next + 1'b1;
+                        end else begin
+                            bank_win_valid[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= 1'b0;
+                            bank_win_addr[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= {BANK_ADDR_WIDTH{1'b0}};
+                            bank_win_data[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= {DATA_WIDTH{1'b0}};
+                        end
                     end
 
-                    if (enqueue_fire && acc_ready_vec[bank_idx]) begin
-                        enq_ptr = q_count_next[QUEUE_PTR_WIDTH-1:0];
+                    if (enqueue_fire && (!ENABLE_PREVIEW_RESERVE ? acc_ready_vec[bank_idx] : 1'b1)) begin
                         for (enqueue_idx = 0; enqueue_idx < UPDATE_CHANNELS; enqueue_idx = enqueue_idx + 1) begin
                             if (pp_valid_all[enqueue_idx] &&
                                 (addr[enqueue_idx] < DEPTH) &&
                                 (bank_sel[enqueue_idx] == bank_idx[BANK_SEL_WIDTH-1:0])) begin
-                                bank_q_valid[enq_ptr] <= 1'b1;
-                                bank_q_addr[enq_ptr] <= bank_addr[enqueue_idx];
-                                bank_q_data[enq_ptr] <= pp[enqueue_idx];
-                                enq_ptr = enq_ptr + 1'b1;
+                                if (win_count_next < ISSUE_WINDOW) begin
+                                    bank_win_valid[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= 1'b1;
+                                    bank_win_addr[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= bank_addr[enqueue_idx];
+                                    bank_win_data[win_count_next[ISSUE_PTR_WIDTH-1:0]] <= pp[enqueue_idx];
+                                    win_count_next = win_count_next + 1'b1;
+                                end else begin
+                                    overflow_push_ptr = overflow_tail_next;
+                                    bank_overflow_valid[overflow_push_ptr] <= 1'b1;
+                                    bank_overflow_addr[overflow_push_ptr] <= bank_addr[enqueue_idx];
+                                    bank_overflow_data[overflow_push_ptr] <= pp[enqueue_idx];
+                                    overflow_tail_next = (overflow_tail_next == (OVERFLOW_DEPTH - 1)) ? {OVERFLOW_PTR_WIDTH{1'b0}} : overflow_tail_next + 1'b1;
+                                    overflow_count_next = overflow_count_next + 1'b1;
+                                end
                                 q_count_next = q_count_next + 1'b1;
                             end
                         end
+                        if (ENABLE_PREVIEW_RESERVE) begin
+                            q_reserved_next = q_reserved_next - bank_hit_count[QUEUE_COUNT_WIDTH-1:0];
+                        end
                     end
 
-                    bank_q_head <= {QUEUE_PTR_WIDTH{1'b0}};
-                    bank_q_tail <= q_count_next[QUEUE_PTR_WIDTH-1:0];
                     bank_q_count <= q_count_next;
+                    bank_reserved_count <= q_reserved_next;
+                    bank_win_count <= win_count_next;
+                    bank_overflow_count <= overflow_count_next;
+                    bank_overflow_head <= overflow_head_next;
+                    bank_overflow_tail <= overflow_tail_next;
 
-                    if (bank_result_valid) begin
-                        bank_ram[bank_addr_pipe[ADD_LATENCY-1]] <= bank_new_data;
-                    end
                 end
             end
         end
