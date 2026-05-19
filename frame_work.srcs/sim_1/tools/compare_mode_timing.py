@@ -299,9 +299,94 @@ def safe_div(num: float | int | None, den: float | int | None) -> float | None:
     return float(num) / float(den)
 
 
+def process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    return True
+
+
+def acquire_tb_lock(lock_path: Path) -> int:
+    try:
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        lock_text = lock_path.read_text(encoding="utf-8", errors="ignore").strip()
+        try:
+            lock_pid = int(lock_text)
+        except ValueError:
+            lock_pid = -1
+        if process_exists(lock_pid):
+            raise RuntimeError(f"testbench patch lock exists: {lock_path}; another runner may be active") from exc
+        lock_path.unlink(missing_ok=True)
+        lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.write(lock_fd, str(os.getpid()).encode("ascii"))
+    return lock_fd
+
+
+def speedup(a: float | None, b: float | None) -> float | None:
+    if a is None or b is None or b == 0:
+        return None
+    return a / b
+
+
+MODE_LABEL = {0: "RAW_B8C", 1: "ID52", 2: "CSR"}
+
+
+def build_comparison_report(args: argparse.Namespace, run_modes: tuple[int, ...], metric_rows: list[dict[str, Any]]) -> dict[str, Any]:
+    rows_by_mode = {int(row["mode"]): row for row in metric_rows}
+    pairwise = []
+    for baseline, candidate in ((0, 1), (0, 2), (1, 2)):
+        if baseline not in rows_by_mode or candidate not in rows_by_mode:
+            continue
+        base_row = rows_by_mode[baseline]
+        cand_row = rows_by_mode[candidate]
+        pairwise.append(
+            {
+                "baseline_mode": baseline,
+                "baseline": MODE_LABEL.get(baseline, f"MODE{baseline}"),
+                "candidate_mode": candidate,
+                "candidate": MODE_LABEL.get(candidate, f"MODE{candidate}"),
+                "input_payload_speedup": speedup(base_row.get("input_payload_beats"), cand_row.get("input_payload_beats")),
+                "total_compute_to_finish_speedup": speedup(base_row.get("total_compute_to_finish_ns"), cand_row.get("total_compute_to_finish_ns")),
+                "total_compute_cycle_speedup": speedup(base_row.get("total_compute_cycles"), cand_row.get("total_compute_cycles")),
+                "baseline_passed": base_row.get("passed"),
+                "candidate_passed": cand_row.get("passed"),
+            }
+        )
+    return {
+        "fairness_config": {
+            "data_dir": str(Path(args.data_dir).resolve()) if args.data_dir else None,
+            "parallelism": args.parallelism,
+            "symmetric_upper_only": args.symmetric_upper_only,
+            "metadata_format": args.metadata_format,
+            "decouple_id_meta": args.decouple_id_meta,
+            "id_q_depth": args.id_q_depth,
+            "meta_q_depth": args.meta_q_depth,
+            "y_queue_depth": args.y_queue_depth,
+            "y_limited_bypass_window": args.y_limited_bypass_window,
+            "y_issue_window": args.y_issue_window,
+            "clock_period_ns": args.clock_period_ns,
+            "comparison_domain": args.comparison_domain,
+            "backend_pressure_domain": args.backend_pressure_domain,
+            "run_id": args.run_id or args.prefix,
+            "changed_between_modes": ["MODE_ID52", "COMPUTE_FORMAT", "active input stream file"],
+        },
+        "modes": [MODE_LABEL.get(mode, f"MODE{mode}") for mode in run_modes],
+        "rows": metric_rows,
+        "pairwise_speedups": pairwise,
+        "all_modes_passed": all(bool(row.get("passed")) for row in metric_rows),
+        "all_diagnostics_complete": all(bool(row.get("diagnostic_fields_complete")) for row in metric_rows),
+    }
+
+
 def infer_strategy(audit: dict[str, Any], mode: int) -> str:
     if mode == 0:
         return "B8C-raw-stream"
+    if mode == 2:
+        return "CSR-lane-bank-stream"
     input_kind = str(audit.get("input_kind") or "")
     if "cluster" in input_kind:
         return "B8C-clustered-ID52"
@@ -584,6 +669,16 @@ def main() -> None:
         help=argparse.SUPPRESS,
     )
     ap.add_argument(
+        "--csr-only",
+        action="store_true",
+        help="run COMPUTE_FORMAT=2 CSR path only",
+    )
+    ap.add_argument(
+        "--include-csr",
+        action="store_true",
+        help="include COMPUTE_FORMAT=2 CSR path in the default comparison run",
+    )
+    ap.add_argument(
         "--sweep-decouple-id-meta",
         default="0,1",
         help="comma-separated DECOUPLE_ID_META values for --id52-sweep",
@@ -634,6 +729,11 @@ def main() -> None:
         help="optional CSV path for machine-readable timing/bottleneck rows",
     )
     ap.add_argument(
+        "--comparison-report-json",
+        default=None,
+        help="optional JSON path for fair comparison summary with pairwise speedups",
+    )
+    ap.add_argument(
         "--clock-period-ns",
         type=float,
         default=10.0,
@@ -645,8 +745,9 @@ def main() -> None:
         help="fail if READY/DEC_DETAIL/BANK/STALL fields required for bottleneck claims are missing",
     )
     args = ap.parse_args()
-    if args.mode0_only and args.mode1_only:
-        ap.error("--mode0-only and --mode1-only cannot be used together")
+    selected_only_modes = sum(1 for enabled in (args.mode0_only, args.mode1_only, args.csr_only) if enabled)
+    if selected_only_modes > 1:
+        ap.error("--mode0-only, --mode1-only, and --csr-only are mutually exclusive")
     apply_artifact_audit_defaults(args)
     if args.data_dir is not None:
         audit_format = load_artifact_audit(args.data_dir).get("metadata_format")
@@ -747,14 +848,21 @@ def main() -> None:
         run_modes = (0,)
     elif args.mode1_only:
         run_modes = (1,)
+    elif args.csr_only:
+        run_modes = (2,)
+    elif args.include_csr:
+        run_modes = (0, 1, 2) if args.parallelism == 8 else (1, 2)
     else:
         run_modes = (0, 1) if args.parallelism == 8 else (1,)
 
     if not args.reuse_logs:
+        lock_path = tb_file.with_suffix(tb_file.suffix + ".lock")
+        lock_fd = acquire_tb_lock(lock_path)
         original_tb = tb_file.read_text(encoding="utf-8")
         try:
             for mode in run_modes:
-                set_tb_param(tb_file, "MODE_ID52", f"1'b{mode}")
+                set_tb_param(tb_file, "MODE_ID52", "1'b1" if mode == 1 else "1'b0")
+                set_tb_param(tb_file, "COMPUTE_FORMAT", str(mode))
                 set_tb_param(tb_file, "DECOUPLE_ID_META", f"1'b{args.decouple_id_meta}")
                 set_tb_param(tb_file, "ID_Q_DEPTH", str(args.id_q_depth))
                 set_tb_param(tb_file, "META_Q_DEPTH", str(args.meta_q_depth))
@@ -780,6 +888,12 @@ def main() -> None:
                     set_tb_param(tb_file, "Y_STREAM_FILE", f"\"{data_dir}/y_stream.hex\"")
                     set_tb_param(tb_file, "COMPUTE_STREAM_FILE", f"\"{data_dir}/compute_stream.hex\"")
                     set_tb_param(tb_file, "COMPUTE_ID_STREAM_FILE", f"\"{data_dir}/compute_id_stream.hex\"")
+                    set_tb_param(tb_file, "CSR_STREAM_FILE", f"\"{data_dir}/csr_stream.hex\"")
+                    audit_path = Path(args.data_dir) / "artifact_audit.json"
+                    if audit_path.exists():
+                        audit = json.loads(audit_path.read_text(encoding="utf-8"))
+                        if audit.get("csr_compute_beats") is not None:
+                            set_tb_param(tb_file, "CSR_COMPUTE_BEATS", str(int(audit["csr_compute_beats"])))
                     set_tb_param(tb_file, "LUT_FILE", f"\"{data_dir}/lut.hex\"")
                     set_tb_param(tb_file, "GOLDEN_Y_FILE", f"\"{data_dir}/golden_y.hex\"")
 
@@ -860,16 +974,13 @@ def main() -> None:
                 )
         finally:
             tb_file.write_text(original_tb, encoding="utf-8")
+            os.close(lock_fd)
+            lock_path.unlink(missing_ok=True)
 
     metrics_by_mode: dict[int, SimMetrics] = {
         mode: parse_log(mode, xsim_dir / f"simulate_{args.prefix}_m{mode}.log")
         for mode in run_modes
     }
-
-    def speedup(a: float | None, b: float | None) -> float | None:
-        if a is None or b is None or b == 0:
-            return None
-        return a / b
 
     metric_rows = [
         metric_row(args.prefix, args.parallelism, args.decouple_id_meta, args.id_q_depth, args.meta_q_depth, args.y_queue_depth, args.y_limited_bypass_window, args.y_issue_window, metrics_by_mode[mode], args.data_dir, args.run_id, args.comparison_domain, args.backend_pressure_domain, args.clock_period_ns, args.metadata_format)
@@ -890,6 +1001,12 @@ def main() -> None:
             writer.writeheader()
             writer.writerows(metric_rows)
         print(f"Wrote metrics CSV: {metrics_csv}")
+    if args.comparison_report_json:
+        comparison_report_json = Path(args.comparison_report_json)
+        comparison_report_json.parent.mkdir(parents=True, exist_ok=True)
+        comparison_report = build_comparison_report(args, run_modes, metric_rows)
+        comparison_report_json.write_text(json.dumps(comparison_report, indent=2), encoding="utf-8")
+        print(f"Wrote comparison report JSON: {comparison_report_json}")
 
     print("\n=== MODE Compare ===")
     print(
@@ -900,95 +1017,60 @@ def main() -> None:
         f"ID_Q_DEPTH={args.id_q_depth}, META_Q_DEPTH={args.meta_q_depth}"
     )
 
-    if run_modes == (0, 1):
+    mode_label = MODE_LABEL
+    metrics_to_print = (
+        ("pass", lambda m: str(m.passed)),
+        ("mismatches", lambda m: fmt(m.mismatches)),
+        ("compute_beats", lambda m: fmt(m.compute_beats)),
+        ("compute_start_ns", lambda m: fmt(m.compute_start_ns)),
+        ("all_data_ns", lambda m: fmt(m.all_data_ns)),
+        ("writeback_start_ns", lambda m: fmt(m.writeback_start_ns)),
+        ("finish_ns", lambda m: fmt(m.finish_ns)),
+        ("feed_ns (start->all_data)", lambda m: fmt(m.feed_ns)),
+        ("drain_ns (all_data->writeback)", lambda m: fmt(m.drain_ns)),
+        ("store_check_ns (writeback->finish)", lambda m: fmt(m.store_check_ns)),
+        ("total_compute_to_finish_ns", lambda m: fmt(m.total_compute_to_finish_ns)),
+        ("ready_total_cycles", lambda m: fmt(m.ready_total_cycles)),
+        ("ready_high_cycles", lambda m: fmt(m.ready_high_cycles)),
+        ("ready_low_cycles", lambda m: fmt(m.ready_low_cycles)),
+        ("ready_low_ratio", lambda m: fmt(m.ready_low_ratio)),
+        ("dec_id_empty_cycles", lambda m: fmt(m.dec_id_empty_cycles)),
+        ("dec_id_full_cycles", lambda m: fmt(m.dec_id_full_cycles)),
+        ("dec_meta_empty_cycles", lambda m: fmt(m.dec_meta_empty_cycles)),
+        ("dec_meta_full_cycles", lambda m: fmt(m.dec_meta_full_cycles)),
+        ("dec_pair_wait_cycles", lambda m: fmt(m.dec_pair_wait_cycles)),
+        ("dec_consume_cycles", lambda m: fmt(m.dec_consume_cycles)),
+        ("dec_decoder_valid_cycles", lambda m: fmt(m.dec_decoder_valid_cycles)),
+        ("dec_compute_req_cycles", lambda m: fmt(m.dec_compute_req_cycles)),
+        ("dec_compute_backpressure_cycles", lambda m: fmt(m.dec_compute_backpressure_cycles)),
+        ("dec_no_decoder_valid_cycles", lambda m: fmt(m.dec_no_decoder_valid_cycles)),
+        ("dec_both_ready_cycles", lambda m: fmt(m.dec_both_ready_cycles)),
+        ("dec_both_empty_cycles", lambda m: fmt(m.dec_both_empty_cycles)),
+        ("dec_id_only_wait_cycles", lambda m: fmt(m.dec_id_only_wait_cycles)),
+        ("dec_meta_only_wait_cycles", lambda m: fmt(m.dec_meta_only_wait_cycles)),
+        ("dec_id_q_occupancy_max", lambda m: fmt(m.dec_id_q_occupancy_max)),
+        ("dec_meta_q_occupancy_max", lambda m: fmt(m.dec_meta_q_occupancy_max)),
+    )
+    headers = [mode_label.get(mode, f"MODE{mode}") for mode in run_modes]
+    print("| Metric | " + " | ".join(headers) + " |")
+    print("|---|" + "---:|" * len(headers))
+    for name, getter in metrics_to_print:
+        print("| " + name + " | " + " | ".join(getter(metrics_by_mode[mode]) for mode in run_modes) + " |")
+    if 0 in metrics_by_mode and 1 in metrics_by_mode:
         m0 = metrics_by_mode[0]
         m1 = metrics_by_mode[1]
-        all_data_su = speedup(m0.all_data_ns, m1.all_data_ns)
-        finish_su = speedup(m0.finish_ns, m1.finish_ns)
-        feed_su = speedup(m0.feed_ns, m1.feed_ns)
-        drain_su = speedup(m0.drain_ns, m1.drain_ns)
-        store_su = speedup(m0.store_check_ns, m1.store_check_ns)
-        total_su = speedup(m0.total_compute_to_finish_ns, m1.total_compute_to_finish_ns)
-        ready_low_ratio_su = speedup(m0.ready_low_ratio, m1.ready_low_ratio)
-
-        print("| Metric | MODE0 | MODE1 | Speedup(M0/M1) |")
-        print("|---|---:|---:|---:|")
-        print(f"| pass | {m0.passed} | {m1.passed} | N/A |")
-        print(f"| mismatches | {fmt(m0.mismatches)} | {fmt(m1.mismatches)} | N/A |")
-        print(f"| compute_beats | {fmt(m0.compute_beats)} | {fmt(m1.compute_beats)} | {fmt(speedup(float(m0.compute_beats) if m0.compute_beats else None, float(m1.compute_beats) if m1.compute_beats else None))} |")
-        print(f"| compute_start_ns | {fmt(m0.compute_start_ns)} | {fmt(m1.compute_start_ns)} | {fmt(speedup(m0.compute_start_ns, m1.compute_start_ns))} |")
-        print(f"| all_data_ns | {fmt(m0.all_data_ns)} | {fmt(m1.all_data_ns)} | {fmt(all_data_su)} |")
-        print(f"| writeback_start_ns | {fmt(m0.writeback_start_ns)} | {fmt(m1.writeback_start_ns)} | {fmt(speedup(m0.writeback_start_ns, m1.writeback_start_ns))} |")
-        print(f"| finish_ns | {fmt(m0.finish_ns)} | {fmt(m1.finish_ns)} | {fmt(finish_su)} |")
-        print(f"| feed_ns (start->all_data) | {fmt(m0.feed_ns)} | {fmt(m1.feed_ns)} | {fmt(feed_su)} |")
-        print(f"| drain_ns (all_data->writeback) | {fmt(m0.drain_ns)} | {fmt(m1.drain_ns)} | {fmt(drain_su)} |")
-        print(f"| store_check_ns (writeback->finish) | {fmt(m0.store_check_ns)} | {fmt(m1.store_check_ns)} | {fmt(store_su)} |")
-        print(f"| total_compute_to_finish_ns | {fmt(m0.total_compute_to_finish_ns)} | {fmt(m1.total_compute_to_finish_ns)} | {fmt(total_su)} |")
-        print(f"| ready_total_cycles | {fmt(m0.ready_total_cycles)} | {fmt(m1.ready_total_cycles)} | N/A |")
-        print(f"| ready_high_cycles | {fmt(m0.ready_high_cycles)} | {fmt(m1.ready_high_cycles)} | N/A |")
-        print(f"| ready_low_cycles | {fmt(m0.ready_low_cycles)} | {fmt(m1.ready_low_cycles)} | N/A |")
-        print(f"| ready_low_ratio | {fmt(m0.ready_low_ratio)} | {fmt(m1.ready_low_ratio)} | {fmt(ready_low_ratio_su)} |")
-        print(f"| dec_id_empty_cycles | {fmt(m0.dec_id_empty_cycles)} | {fmt(m1.dec_id_empty_cycles)} | N/A |")
-        print(f"| dec_id_full_cycles | {fmt(m0.dec_id_full_cycles)} | {fmt(m1.dec_id_full_cycles)} | N/A |")
-        print(f"| dec_meta_empty_cycles | {fmt(m0.dec_meta_empty_cycles)} | {fmt(m1.dec_meta_empty_cycles)} | N/A |")
-        print(f"| dec_meta_full_cycles | {fmt(m0.dec_meta_full_cycles)} | {fmt(m1.dec_meta_full_cycles)} | N/A |")
-        print(f"| dec_pair_wait_cycles | {fmt(m0.dec_pair_wait_cycles)} | {fmt(m1.dec_pair_wait_cycles)} | N/A |")
-        print(f"| dec_consume_cycles | {fmt(m0.dec_consume_cycles)} | {fmt(m1.dec_consume_cycles)} | N/A |")
-        print(f"| dec_decoder_valid_cycles | {fmt(m0.dec_decoder_valid_cycles)} | {fmt(m1.dec_decoder_valid_cycles)} | N/A |")
-        print(f"| dec_compute_req_cycles | {fmt(m0.dec_compute_req_cycles)} | {fmt(m1.dec_compute_req_cycles)} | N/A |")
-        print(f"| dec_compute_backpressure_cycles | {fmt(m0.dec_compute_backpressure_cycles)} | {fmt(m1.dec_compute_backpressure_cycles)} | N/A |")
-        print(f"| dec_no_decoder_valid_cycles | {fmt(m0.dec_no_decoder_valid_cycles)} | {fmt(m1.dec_no_decoder_valid_cycles)} | N/A |")
-        print(f"| dec_both_ready_cycles | {fmt(m0.dec_both_ready_cycles)} | {fmt(m1.dec_both_ready_cycles)} | N/A |")
-        print(f"| dec_both_empty_cycles | {fmt(m0.dec_both_empty_cycles)} | {fmt(m1.dec_both_empty_cycles)} | N/A |")
-        print(f"| dec_id_only_wait_cycles | {fmt(m0.dec_id_only_wait_cycles)} | {fmt(m1.dec_id_only_wait_cycles)} | N/A |")
-        print(f"| dec_meta_only_wait_cycles | {fmt(m0.dec_meta_only_wait_cycles)} | {fmt(m1.dec_meta_only_wait_cycles)} | N/A |")
-        print(f"| dec_id_q_occupancy_max | {fmt(m0.dec_id_q_occupancy_max)} | {fmt(m1.dec_id_q_occupancy_max)} | N/A |")
-        print(f"| dec_meta_q_occupancy_max | {fmt(m0.dec_meta_q_occupancy_max)} | {fmt(m1.dec_meta_q_occupancy_max)} | N/A |")
-        print("\nLogs:")
-        print(f"- MODE0: {m0.sim_log}")
-        print(f"- MODE1: {m1.sim_log}")
-    elif run_modes == (1,):
-        m1 = metrics_by_mode[1]
-        print("MODE1-only flow.")
-        print("| Metric | MODE1 |")
-        print("|---|---:|")
-        print(f"| pass | {m1.passed} |")
-        print(f"| mismatches | {fmt(m1.mismatches)} |")
-        print(f"| compute_beats | {fmt(m1.compute_beats)} |")
-        print(f"| all_data_ns | {fmt(m1.all_data_ns)} |")
-        print(f"| writeback_start_ns | {fmt(m1.writeback_start_ns)} |")
-        print(f"| finish_ns | {fmt(m1.finish_ns)} |")
-        print(f"| total_compute_to_finish_ns | {fmt(m1.total_compute_to_finish_ns)} |")
-        print(f"| ready_low_ratio | {fmt(m1.ready_low_ratio)} |")
-        print(f"| dec_pair_wait_cycles | {fmt(m1.dec_pair_wait_cycles)} |")
-        print(f"| dec_consume_cycles | {fmt(m1.dec_consume_cycles)} |")
-        print(f"| dec_decoder_valid_cycles | {fmt(m1.dec_decoder_valid_cycles)} |")
-        print(f"| dec_compute_req_cycles | {fmt(m1.dec_compute_req_cycles)} |")
-        print(f"| dec_compute_backpressure_cycles | {fmt(m1.dec_compute_backpressure_cycles)} |")
-        print(f"| dec_no_decoder_valid_cycles | {fmt(m1.dec_no_decoder_valid_cycles)} |")
-        print(f"| dec_both_ready_cycles | {fmt(m1.dec_both_ready_cycles)} |")
-        print(f"| dec_both_empty_cycles | {fmt(m1.dec_both_empty_cycles)} |")
-        print(f"| dec_id_only_wait_cycles | {fmt(m1.dec_id_only_wait_cycles)} |")
-        print(f"| dec_meta_only_wait_cycles | {fmt(m1.dec_meta_only_wait_cycles)} |")
-        print(f"| dec_id_q_occupancy_max | {fmt(m1.dec_id_q_occupancy_max)} |")
-        print(f"| dec_meta_q_occupancy_max | {fmt(m1.dec_meta_q_occupancy_max)} |")
-        print("\nLogs:")
-        print(f"- MODE1: {m1.sim_log}")
-    elif run_modes == (0,):
+        print(f"\nRAW_B8C/ID52 total_compute_to_finish speedup: {fmt(speedup(m0.total_compute_to_finish_ns, m1.total_compute_to_finish_ns))}")
+    if 0 in metrics_by_mode and 2 in metrics_by_mode:
         m0 = metrics_by_mode[0]
-        print("MODE0-only flow.")
-        print("| Metric | MODE0 |")
-        print("|---|---:|")
-        print(f"| pass | {m0.passed} |")
-        print(f"| mismatches | {fmt(m0.mismatches)} |")
-        print(f"| compute_beats | {fmt(m0.compute_beats)} |")
-        print(f"| all_data_ns | {fmt(m0.all_data_ns)} |")
-        print(f"| writeback_start_ns | {fmt(m0.writeback_start_ns)} |")
-        print(f"| finish_ns | {fmt(m0.finish_ns)} |")
-        print(f"| total_compute_to_finish_ns | {fmt(m0.total_compute_to_finish_ns)} |")
-        print(f"| ready_low_ratio | {fmt(m0.ready_low_ratio)} |")
-        print("\nLogs:")
-        print(f"- MODE0: {m0.sim_log}")
+        m2 = metrics_by_mode[2]
+        print(f"RAW_B8C/CSR total_compute_to_finish speedup: {fmt(speedup(m0.total_compute_to_finish_ns, m2.total_compute_to_finish_ns))}")
+    if 1 in metrics_by_mode and 2 in metrics_by_mode:
+        m1 = metrics_by_mode[1]
+        m2 = metrics_by_mode[2]
+        print(f"ID52/CSR total_compute_to_finish speedup: {fmt(speedup(m1.total_compute_to_finish_ns, m2.total_compute_to_finish_ns))}")
+    print("\nLogs:")
+    for mode in run_modes:
+        print(f"- {mode_label.get(mode, f'MODE{mode}')}: {metrics_by_mode[mode].sim_log}")
 
 
 if __name__ == "__main__":

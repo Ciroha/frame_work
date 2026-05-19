@@ -47,6 +47,9 @@ FP64_HEX_CHARS = 16
 AXI_FP64_PER_BEAT = AXI_HEX_CHARS // FP64_HEX_CHARS  # 8 x FP64 per 512-bit beat
 ID_HEX_CHARS = 2
 ID_PER_AXI_BEAT = AXI_HEX_CHARS // ID_HEX_CHARS  # 64 x 8-bit IDs per 512-bit beat
+CSR_TUPLE_BITS = 97
+CSR_GROUP_BITS = 1024
+CSR_RESERVED_LSB = CSR_TUPLE_BITS * 8
 
 
 class UniqueValueOverflowError(ValueError):
@@ -524,6 +527,75 @@ def build_meta_v2_lines_for_chunk(chunk: Sequence[Beat], block_index: int) -> Li
     return lines
 
 
+def build_csr_stream(entries: Sequence[Tuple[int, int, float]], rows: int, cols: int, lanes: int) -> Tuple[List[str], dict]:
+    if lanes != AXI_FP64_PER_BEAT:
+        raise ValueError("CSR Phase 1 supports only --lanes 8")
+    if rows <= 0 or cols <= 0:
+        raise ValueError("CSR stream requires positive rows/cols")
+    if rows > 0x10000 or cols > 0x10000:
+        raise ValueError(f"CSR Phase 1 row/col dimensions must fit 16 bits: rows={rows}, cols={cols}")
+
+    sorted_entries = sorted(entries, key=lambda item: (item[0], item[1]))
+    groups: List[List[Optional[Tuple[int, int, float]]]] = []
+    current: List[Optional[Tuple[int, int, float]]] = [None] * lanes
+    valid_tuples = 0
+
+    for idx, (row, col, value) in enumerate(sorted_entries):
+        if row < 0 or row >= rows or col < 0 or col >= cols:
+            raise ValueError(f"CSR entry #{idx} out of bounds: row={row}, col={col}, shape=({rows}, {cols})")
+        if row > 0xFFFF or col > 0xFFFF:
+            raise ValueError(f"CSR entry #{idx} exceeds 16-bit field: row={row}, col={col}")
+        lane = col % lanes
+        if current[lane] is not None:
+            groups.append(current)
+            current = [None] * lanes
+        current[lane] = (row, col, value)
+        valid_tuples += 1
+
+    if any(slot is not None for slot in current) or not groups:
+        groups.append(current)
+
+    lines: List[str] = []
+    padding_lanes = 0
+    for group_index, group in enumerate(groups):
+        blob = 0
+        for lane, item in enumerate(group):
+            base = lane * CSR_TUPLE_BITS
+            if item is None:
+                padding_lanes += 1
+                continue
+            row, col, value = item
+            expected_lane = col % lanes
+            if expected_lane != lane:
+                raise RuntimeError(
+                    f"internal CSR lane-bank packing error at group={group_index} lane={lane}: col={col} expected_lane={expected_lane}"
+                )
+            tuple_bits = 1
+            tuple_bits |= (row & 0xFFFF) << 1
+            tuple_bits |= (col & 0xFFFF) << 17
+            tuple_bits |= f64_to_u64(value) << 33
+            blob |= tuple_bits << base
+        if blob >> CSR_RESERVED_LSB:
+            raise RuntimeError("internal CSR pack error: reserved bits are non-zero")
+        for beat in range(CSR_GROUP_BITS // AXI_BITS):
+            line_val = (blob >> (AXI_BITS * beat)) & ((1 << AXI_BITS) - 1)
+            lines.append(f"{line_val:0{AXI_HEX_CHARS}X}")
+
+    return lines, {
+        "csr_stream_generated": True,
+        "csr_stream_beats": len(lines),
+        "csr_group_count": len(groups),
+        "csr_tuple_bits": CSR_TUPLE_BITS,
+        "csr_group_bits": CSR_GROUP_BITS,
+        "csr_reserved_lsb": CSR_RESERVED_LSB,
+        "valid_tuples": valid_tuples,
+        "csr_padding_lanes": padding_lanes,
+        "csr_lane_bank_packed": True,
+        "csr_order": "row_major_with_lane_bank_grouping",
+        "csr_beats_per_group": CSR_GROUP_BITS // AXI_BITS,
+    }
+
+
 def build_compute_id_stream(
     beats: Sequence[Beat],
     value_to_id: Dict[int, int],
@@ -629,6 +701,21 @@ def compute_golden_y(
     return y
 
 
+def compute_golden_y_from_entries(
+    entries: Sequence[Tuple[int, int, float]],
+    x_vec: Sequence[float],
+    y_init: Sequence[float],
+    y_elems: int,
+) -> List[float]:
+    y = list(y_init) + [0.0] * (y_elems - len(y_init))
+    for row, col, value in entries:
+        if row < 0 or row >= y_elems:
+            continue
+        x = x_vec[col] if 0 <= col < len(x_vec) else 0.0
+        y[row] += value * x
+    return y
+
+
 def write_lines(path: str, lines: Sequence[str]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="ascii", newline="\n") as f:
@@ -648,6 +735,7 @@ def main() -> None:
     ap.add_argument("--out-dir", required=True, help="output directory for .hex files")
     ap.add_argument("--lanes", type=int, choices=(8, 16, 32), default=8, help="compute lanes (tb PARALLELISM)")
     ap.add_argument("--metadata-format", choices=("v1", "v2"), default="v1", help="ID52 metadata encoding")
+    ap.add_argument("--emit-csr-stream", action="store_true", help="also emit Phase 1 bank-compatible CSR tuple stream")
     ap.add_argument("--vector-depth", type=int, default=16, help="X logical depth (tb VECTOR_DEPTH)")
     ap.add_argument("--y-elems", type=int, default=None, help="Y scalar length (default: max row + 1)")
     ap.add_argument("--x-file", default=None, help="optional x vector text file (one value per line)")
@@ -665,6 +753,13 @@ def main() -> None:
         raise ValueError(f"invalid VAL_BATCH={VAL_BATCH} for lanes={LANES}")
     if args.metadata_format == "v2" and LANES != 32:
         raise ValueError("metadata_v2 is currently supported only for --lanes 32")
+    if args.emit_csr_stream:
+        if args.b8c_json:
+            raise ValueError("CSR stream generation requires --mtx or --clustered-json input")
+        if LANES != AXI_FP64_PER_BEAT:
+            raise ValueError("CSR Phase 1 supports only --lanes 8")
+        if args.symmetric_upper_only:
+            raise ValueError("CSR Phase 1 does not support --symmetric-upper-only")
     if (LANES % AXI_FP64_PER_BEAT) != 0:
         raise ValueError(f"lanes ({LANES}) must be a multiple of {AXI_FP64_PER_BEAT}")
 
@@ -780,19 +875,27 @@ def main() -> None:
     y_stream = build_y_stream(y_init, y_elems)
 
     compute_stream = build_compute_stream(beats)
-    golden = compute_golden_y(
-        beats,
-        x_vec,
-        y_init,
-        y_elems,
-        symmetric_upper_only=args.symmetric_upper_only,
-    )
+    csr_stream: List[str] = []
+    csr_audit: dict = {"csr_stream_generated": False, "csr_stream_beats": 0}
+    if args.emit_csr_stream:
+        csr_stream, csr_audit = build_csr_stream(entries, m_rows, m_cols, LANES)
+        golden = compute_golden_y_from_entries(entries, x_vec, y_init, y_elems)
+    else:
+        golden = compute_golden_y(
+            beats,
+            x_vec,
+            y_init,
+            y_elems,
+            symmetric_upper_only=args.symmetric_upper_only,
+        )
     golden_hex = [u64_to_hex16(f64_to_u64(v)) for v in golden]
 
     out_dir = args.out_dir
     write_lines(os.path.join(out_dir, "x_stream.hex"), x_stream)
     write_lines(os.path.join(out_dir, "y_stream.hex"), y_stream)
     write_lines(os.path.join(out_dir, "compute_stream.hex"), compute_stream)
+    if args.emit_csr_stream:
+        write_lines(os.path.join(out_dir, "csr_stream.hex"), csr_stream)
     write_lines(os.path.join(out_dir, "golden_y.hex"), golden_hex)
     if compute_id_stream is not None:
         write_lines(os.path.join(out_dir, "compute_id_stream.hex"), compute_id_stream)
@@ -801,12 +904,15 @@ def main() -> None:
     compute_beats = len(compute_stream)
     aligned_vals = len(beats) * LANES
     blocks = len(beats) // VAL_BATCH
+    audit_metadata.update(csr_audit)
     audit_metadata.update(
         {
             "y_elems": y_elems,
             "x_length": len(x_vec),
             "y_init_length": len(y_init),
             "mat_data_beats": mat_data_beats,
+            "csr_compute_beats": len(csr_stream),
+            "active_compute_beats": len(csr_stream) if args.emit_csr_stream else mat_data_beats,
             "aligned_values": aligned_vals,
             "blocks": blocks,
             "compute_stream_beats": compute_beats,
@@ -831,6 +937,8 @@ def main() -> None:
         print(f"  compute_stream.hex beats={compute_beats} (data={mat_data_beats}, meta={compute_beats - mat_data_beats})")
     else:
         print("  compute_stream.hex skipped for lanes != AXI FP64 lanes (MODE_ID52=1 only)")
+    if args.emit_csr_stream:
+        print(f"  csr_stream.hex     beats={len(csr_stream)} groups={csr_audit['csr_group_count']} valid_tuples={csr_audit['valid_tuples']}")
     print(f"  golden_y.hex       scalars={len(golden_hex)}")
     print("  artifact_audit.json written")
     if lut_u64 is not None:
@@ -852,6 +960,10 @@ def main() -> None:
     print(f"  MAT_DATA_BEATS = {mat_data_beats}")
     if compute_stream:
         print(f"  COMPUTE_BEATS  = {compute_beats}")
+    if args.emit_csr_stream:
+        print("  COMPUTE_FORMAT = 2")
+        print(f"  CSR_COMPUTE_BEATS = {len(csr_stream)}")
+        print(f"  CSR_STREAM_FILE = {os.path.join(out_dir, 'csr_stream.hex')}")
     if args.symmetric_upper_only:
         print("  SYMMETRIC_UPPER_ONLY = 1")
 

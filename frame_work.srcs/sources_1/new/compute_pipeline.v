@@ -9,6 +9,7 @@ module compute_pipeline #(
 )(
     input  wire clk,
     input  wire in_valid,
+    input  wire [PARALLELISM-1:0] lane_valid_mask,
     input  wire [PARALLELISM*DATA_WIDTH-1:0] matrix_values,
     input  wire [PARALLELISM*DATA_WIDTH-1:0] x_values_main,
     input  wire [PARALLELISM*DATA_WIDTH-1:0] x_values_sym,
@@ -37,7 +38,7 @@ module compute_pipeline #(
                     .LATENCY(MUL_LATENCY)
                 ) u_mul_main (
                     .clk(clk),
-                    .s_valid(in_valid),
+                    .s_valid(in_valid && lane_valid_mask[k_ip]),
                     .s_ready(main_ready),
                     .s_a_bits(matrix_values[k_ip*DATA_WIDTH +: DATA_WIDTH]),
                     .s_b_bits(x_values_main[k_ip*DATA_WIDTH +: DATA_WIDTH]),
@@ -52,7 +53,7 @@ module compute_pipeline #(
                         .LATENCY(MUL_LATENCY)
                     ) u_mul_sym (
                         .clk(clk),
-                        .s_valid(in_valid),
+                        .s_valid(in_valid && lane_valid_mask[k_ip]),
                         .s_ready(sym_ready),
                         .s_a_bits(matrix_values[k_ip*DATA_WIDTH +: DATA_WIDTH]),
                         .s_b_bits(x_values_sym[k_ip*DATA_WIDTH +: DATA_WIDTH]),
@@ -93,7 +94,7 @@ module compute_pipeline #(
                         sym_valid_pipe[pipe_idx] <= sym_valid_pipe[pipe_idx-1];
                     end
 
-                    if (in_valid) begin
+                    if (in_valid && lane_valid_mask[k_beh]) begin
                         main_mul_real = $bitstoreal(matrix_values[k_beh*DATA_WIDTH +: DATA_WIDTH]) *
                                         $bitstoreal(x_values_main[k_beh*DATA_WIDTH +: DATA_WIDTH]);
                         main_data_pipe[0] <= $realtobits(main_mul_real);
@@ -140,7 +141,7 @@ module compute_pipeline #(
                 .LATENCY(MUL_LATENCY)
             ) u_mul_main (
                 .clk(clk),
-                .s_valid(in_valid),
+                .s_valid(in_valid && lane_valid_mask[k]),
                 .s_ready(main_ready),
                 .s_a_bits(matrix_values[k*DATA_WIDTH +: DATA_WIDTH]),
                 .s_b_bits(x_values_main[k*DATA_WIDTH +: DATA_WIDTH]),
@@ -155,7 +156,7 @@ module compute_pipeline #(
                     .LATENCY(MUL_LATENCY)
                 ) u_mul_sym (
                     .clk(clk),
-                    .s_valid(in_valid),
+                    .s_valid(in_valid && lane_valid_mask[k]),
                     .s_ready(sym_ready),
                     .s_a_bits(matrix_values[k*DATA_WIDTH +: DATA_WIDTH]),
                     .s_b_bits(x_values_sym[k*DATA_WIDTH +: DATA_WIDTH]),

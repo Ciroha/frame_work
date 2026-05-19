@@ -3,26 +3,27 @@
 module tb_b8c_top_ram();
 
     parameter AXI_WIDTH    = 512;
-    parameter PARALLELISM  = 32;
+    parameter PARALLELISM  = 8;
     parameter MODE_ID52    = 1'b1;
-    parameter ID52_METADATA_FORMAT = 2;
+    parameter COMPUTE_FORMAT = 1;
+    parameter ID52_METADATA_FORMAT = 1;
     parameter SYMMETRIC_UPPER_ONLY = 1'b0;
     parameter SIM_USE_MUL_IP = 1'b1;
     parameter SIM_USE_ADD_IP = 1'b1;
     parameter Y_QUEUE_DEPTH = 256;
     parameter Y_LIMITED_BYPASS_WINDOW = 4;
     parameter Y_ISSUE_WINDOW = 4;
-    parameter SIM_ENABLE_BANK_STATS = 1'b1;
+    parameter SIM_ENABLE_BANK_STATS = 1'b0;
     parameter SIM_PRINT_BATCH_BANK_STATS = 1'b0;
-    parameter SIM_ENABLE_STALL_REASON_STATS = 1'b1;
-    parameter SIM_ENABLE_LAYER1_TRACE = 1'b1;
+    parameter SIM_ENABLE_STALL_REASON_STATS = 1'b0;
+    parameter SIM_ENABLE_LAYER1_TRACE = 1'b0;
     parameter DECOUPLE_ID_META = 1'b0;
     parameter ID_Q_DEPTH   = 8;
     parameter META_Q_DEPTH = 8;
     parameter real Y_ABS_TOL = 1e-9;
-    parameter VECTOR_DEPTH = 257;
-    parameter Y_ELEMS      = 2053;
-    parameter MAT_DATA_BEATS = 588;
+    parameter VECTOR_DEPTH = 1899;
+    parameter Y_ELEMS      = 1899;
+    parameter MAT_DATA_BEATS = 7872;
     localparam IO_LANES       = AXI_WIDTH / 64;
     localparam LANE_RATIO     = PARALLELISM / IO_LANES;
     localparam MAX_ADDR_ELEMS = (VECTOR_DEPTH > Y_ELEMS) ? VECTOR_DEPTH : Y_ELEMS;
@@ -37,15 +38,23 @@ module tb_b8c_top_ram();
     localparam ID_VALS_PER_BEAT = AXI_WIDTH / 8;
     localparam ID_DATA_BEATS  = (MAT_DATA_BEATS * PARALLELISM + ID_VALS_PER_BEAT - 1) / ID_VALS_PER_BEAT;
     localparam COMPUTE_ID_BEATS = ID_DATA_BEATS + ID52_META_BEATS;
-    localparam ACTIVE_COMPUTE_BEATS = MODE_ID52 ? COMPUTE_ID_BEATS : COMPUTE_BEATS;
-    localparam COMPUTE_STREAM_MEM_BEATS = (COMPUTE_BEATS > COMPUTE_ID_BEATS) ? COMPUTE_BEATS : COMPUTE_ID_BEATS;
+    localparam integer RESOLVED_COMPUTE_FORMAT = (COMPUTE_FORMAT >= 0) ? COMPUTE_FORMAT : (MODE_ID52 ? 1 : 0);
+    localparam RAW_B8C_MODE = (RESOLVED_COMPUTE_FORMAT == 0);
+    localparam ID52_MODE = (RESOLVED_COMPUTE_FORMAT == 1);
+    localparam CSR_MODE = (RESOLVED_COMPUTE_FORMAT == 2);
 
-    parameter string X_STREAM_FILE       = "C:/IC/FPGA/frame_work/.omc/tmp_cheb_clustered_p32_v2/x_stream.hex";
-    parameter string Y_STREAM_FILE       = "C:/IC/FPGA/frame_work/.omc/tmp_cheb_clustered_p32_v2/y_stream.hex";
-    parameter string COMPUTE_STREAM_FILE = "C:/IC/FPGA/frame_work/.omc/tmp_cheb_clustered_p32_v2/compute_stream.hex";
-    parameter string COMPUTE_ID_STREAM_FILE = "C:/IC/FPGA/frame_work/.omc/tmp_cheb_clustered_p32_v2/compute_id_stream.hex";
-    parameter string LUT_FILE            = "C:/IC/FPGA/frame_work/.omc/tmp_cheb_clustered_p32_v2/lut.hex";
-    parameter string GOLDEN_Y_FILE       = "C:/IC/FPGA/frame_work/.omc/tmp_cheb_clustered_p32_v2/golden_y.hex";
+    parameter CSR_COMPUTE_BEATS = MAT_DATA_BEATS;
+    localparam ACTIVE_COMPUTE_BEATS = CSR_MODE ? CSR_COMPUTE_BEATS : (ID52_MODE ? COMPUTE_ID_BEATS : COMPUTE_BEATS);
+    localparam COMPUTE_STREAM_MEM_BEATS_ID = (COMPUTE_BEATS > COMPUTE_ID_BEATS) ? COMPUTE_BEATS : COMPUTE_ID_BEATS;
+    localparam COMPUTE_STREAM_MEM_BEATS = (COMPUTE_STREAM_MEM_BEATS_ID > CSR_COMPUTE_BEATS) ? COMPUTE_STREAM_MEM_BEATS_ID : CSR_COMPUTE_BEATS;
+
+    parameter string X_STREAM_FILE       = "C:/IC/FPGA/frame_work/.omc/tmp_collegemsg_exact/x_stream.hex";
+    parameter string Y_STREAM_FILE       = "C:/IC/FPGA/frame_work/.omc/tmp_collegemsg_exact/y_stream.hex";
+    parameter string COMPUTE_STREAM_FILE = "C:/IC/FPGA/frame_work/.omc/tmp_collegemsg_exact/compute_stream.hex";
+    parameter string COMPUTE_ID_STREAM_FILE = "C:/IC/FPGA/frame_work/.omc/tmp_collegemsg_exact/compute_id_stream.hex";
+    parameter string CSR_STREAM_FILE     = "C:/IC/FPGA/frame_work/.omc/tmp_collegemsg_exact/csr_stream.hex";
+    parameter string LUT_FILE            = "C:/IC/FPGA/frame_work/.omc/tmp_collegemsg_exact/lut.hex";
+    parameter string GOLDEN_Y_FILE       = "C:/IC/FPGA/frame_work/.omc/tmp_collegemsg_exact/golden_y.hex";
 
     localparam [63:0] FP64_1_0 = 64'h3FF0_0000_0000_0000;
     localparam [63:0] FP64_2_0 = 64'h4000_0000_0000_0000;
@@ -77,6 +86,7 @@ module tb_b8c_top_ram();
         .AXI_WIDTH(AXI_WIDTH),
         .PARALLELISM(PARALLELISM),
         .MODE_ID52(MODE_ID52),
+        .COMPUTE_FORMAT(COMPUTE_FORMAT),
         .ID52_METADATA_FORMAT(ID52_METADATA_FORMAT),
         .SYMMETRIC_UPPER_ONLY(SYMMETRIC_UPPER_ONLY),
         .SIM_USE_MUL_IP(SIM_USE_MUL_IP),
@@ -136,6 +146,18 @@ module tb_b8c_top_ram();
         if ((PARALLELISM % IO_LANES) != 0) begin
             $fatal(1, "PARALLELISM (%0d) must be multiple of IO_LANES (%0d)", PARALLELISM, IO_LANES);
         end
+        if ((RESOLVED_COMPUTE_FORMAT < 0) || (RESOLVED_COMPUTE_FORMAT > 2)) begin
+            $fatal(1, "Unsupported COMPUTE_FORMAT=%0d resolved=%0d", COMPUTE_FORMAT, RESOLVED_COMPUTE_FORMAT);
+        end
+        if ((COMPUTE_FORMAT == 0 || COMPUTE_FORMAT == 2) && MODE_ID52) begin
+            $fatal(1, "MODE_ID52=1 conflicts with explicit COMPUTE_FORMAT=%0d", COMPUTE_FORMAT);
+        end
+        if (CSR_MODE && (PARALLELISM != IO_LANES)) begin
+            $fatal(1, "CSR Phase 1 requires PARALLELISM=%0d, got %0d", IO_LANES, PARALLELISM);
+        end
+        if (CSR_MODE && SYMMETRIC_UPPER_ONLY) begin
+            $fatal(1, "CSR Phase 1 does not support SYMMETRIC_UPPER_ONLY=1");
+        end
         if ((ID52_METADATA_FORMAT != 1) && (ID52_METADATA_FORMAT != 2)) begin
             $fatal(1, "Unsupported ID52_METADATA_FORMAT=%0d", ID52_METADATA_FORMAT);
         end
@@ -147,13 +169,15 @@ module tb_b8c_top_ram();
                    MAT_DATA_BEATS, META_EMIT_BEATS);
         end
 
-        $display("TB_CONFIG AXI_WIDTH=%0d PARALLELISM=%0d MODE_ID52=%0d ID52_METADATA_FORMAT=%0d META_EMIT_BEATS=%0d META_PHYS_BATCH=%0d SYMMETRIC_UPPER_ONLY=%0d SIM_USE_MUL_IP=%0d SIM_USE_ADD_IP=%0d",
-                 AXI_WIDTH, PARALLELISM, MODE_ID52, ID52_METADATA_FORMAT, META_EMIT_BEATS, META_PHYS_BATCH, SYMMETRIC_UPPER_ONLY, SIM_USE_MUL_IP, SIM_USE_ADD_IP);
+        $display("TB_CONFIG AXI_WIDTH=%0d PARALLELISM=%0d MODE_ID52=%0d COMPUTE_FORMAT=%0d RESOLVED_COMPUTE_FORMAT=%0d ID52_METADATA_FORMAT=%0d META_EMIT_BEATS=%0d META_PHYS_BATCH=%0d SYMMETRIC_UPPER_ONLY=%0d SIM_USE_MUL_IP=%0d SIM_USE_ADD_IP=%0d",
+                 AXI_WIDTH, PARALLELISM, MODE_ID52, COMPUTE_FORMAT, RESOLVED_COMPUTE_FORMAT, ID52_METADATA_FORMAT, META_EMIT_BEATS, META_PHYS_BATCH, SYMMETRIC_UPPER_ONLY, SIM_USE_MUL_IP, SIM_USE_ADD_IP);
         $display("TB_CONFIG Y_QUEUE_DEPTH=%0d Y_LIMITED_BYPASS_WINDOW=%0d Y_ISSUE_WINDOW=%0d ID_Q_DEPTH=%0d META_Q_DEPTH=%0d Y_ABS_TOL=%0.12e",
                  Y_QUEUE_DEPTH, Y_LIMITED_BYPASS_WINDOW, Y_ISSUE_WINDOW, ID_Q_DEPTH, META_Q_DEPTH, Y_ABS_TOL);
         $display("TB_FILES X=%s", X_STREAM_FILE);
         $display("TB_FILES Y=%s", Y_STREAM_FILE);
-        if (MODE_ID52) begin
+        if (CSR_MODE) begin
+            $display("TB_FILES CSR=%s", CSR_STREAM_FILE);
+        end else if (ID52_MODE) begin
             $display("TB_FILES COMPUTE_ID=%s", COMPUTE_ID_STREAM_FILE);
             $display("TB_FILES LUT=%s", LUT_FILE);
         end else begin
@@ -167,7 +191,9 @@ module tb_b8c_top_ram();
 
         require_file(X_STREAM_FILE);
         require_file(Y_STREAM_FILE);
-        if (MODE_ID52) begin
+        if (CSR_MODE) begin
+            require_file(CSR_STREAM_FILE);
+        end else if (ID52_MODE) begin
             require_file(COMPUTE_ID_STREAM_FILE);
             require_file(LUT_FILE);
         end else begin
@@ -179,14 +205,18 @@ module tb_b8c_top_ram();
 
         $readmemh(X_STREAM_FILE, x_stream_mem);
         $readmemh(Y_STREAM_FILE, y_stream_mem);
-        if (MODE_ID52) begin
+        if (CSR_MODE) begin
+            $readmemh(CSR_STREAM_FILE, compute_stream_mem);
+        end else if (ID52_MODE) begin
             $readmemh(COMPUTE_ID_STREAM_FILE, compute_stream_mem);
         end else begin
             $readmemh(COMPUTE_STREAM_FILE, compute_stream_mem);
         end
         $display("Loaded X stream from %s", X_STREAM_FILE);
         $display("Loaded Y stream from %s", Y_STREAM_FILE);
-        if (MODE_ID52) begin
+        if (CSR_MODE) begin
+            $display("Loaded CSR stream from %s", CSR_STREAM_FILE);
+        end else if (ID52_MODE) begin
             $display("Loaded compute(ID+meta) stream from %s", COMPUTE_ID_STREAM_FILE);
             $display("Loaded LUT from %s", LUT_FILE);
         end else begin

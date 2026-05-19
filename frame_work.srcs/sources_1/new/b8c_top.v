@@ -38,7 +38,8 @@ module top #(
     parameter PARALLELISM = 8,           // 并行计算通道数(8/16/32)
     parameter DATA_WIDTH  = 64,          // 数据位宽(FP64为64位)
     parameter AXI_WIDTH   = 512,         // AXI-Stream接口位宽
-    parameter MODE_ID52   = 1'b0,        // 工作模式: 0=传统FP64模式, 1=ID-LUT压缩模式
+    parameter MODE_ID52   = 1'b0,        // 兼容模式: 0=传统FP64模式, 1=ID-LUT压缩模式
+    parameter COMPUTE_FORMAT = -1,       // -1=使用MODE_ID52兼容映射, 0=RAW_B8C, 1=ID52, 2=CSR
     parameter ID52_METADATA_FORMAT = 1,
     parameter SYMMETRIC_UPPER_ONLY = 1'b0, // 对称矩阵优化: 仅计算上三角
     parameter LUT_INIT_FILE = "",        // LUT初始化文件路径(MODE_ID52模式使用)
@@ -95,10 +96,14 @@ module top #(
     localparam integer FP64_MUL_LATENCY = 8;      // FP64乘法IP固定延迟
     localparam integer META_OUT_STAGE = FP64_MUL_LATENCY + 1; // 元数据对齐到乘法输出
     localparam integer COMPUTE_DRAIN_CYCLES = FP64_MUL_LATENCY + 3;  // 计算流水线排空周期数
-    localparam CONTINUOUS_ISSUE_MODE = MODE_ID52 &&
+    localparam integer RESOLVED_COMPUTE_FORMAT = (COMPUTE_FORMAT >= 0) ? COMPUTE_FORMAT : (MODE_ID52 ? 1 : 0);
+    localparam RAW_B8C_MODE = (RESOLVED_COMPUTE_FORMAT == 0);
+    localparam ID52_MODE = (RESOLVED_COMPUTE_FORMAT == 1);
+    localparam CSR_MODE = (RESOLVED_COMPUTE_FORMAT == 2);
+    localparam CONTINUOUS_ISSUE_MODE = ID52_MODE &&
                                        ((PARALLELISM == 8) || (PARALLELISM == 16) || (PARALLELISM == 32)) &&
                                        !SYMMETRIC_UPPER_ONLY;
-    localparam SYMM_CONTINUOUS_ISSUE_MODE = MODE_ID52 &&
+    localparam SYMM_CONTINUOUS_ISSUE_MODE = ID52_MODE &&
                                             (PARALLELISM == 16) &&
                                             SYMMETRIC_UPPER_ONLY;
     localparam CONTINUOUS_ADMISSION_MODE = CONTINUOUS_ISSUE_MODE || SYMM_CONTINUOUS_ISSUE_MODE;
@@ -125,17 +130,26 @@ module top #(
         if ((LANE_RATIO != 1) && (LANE_RATIO != 2) && (LANE_RATIO != 4)) begin
             $fatal(1, "Unsupported LANE_RATIO=%0d (only 1, 2, or 4 supported)", LANE_RATIO);
         end
-        if ((PARALLELISM > IO_LANES) && (MODE_ID52 == 1'b0)) begin
-            $fatal(1, "PARALLELISM>%0d is only supported for MODE_ID52=1 in this version", IO_LANES);
+        if ((RESOLVED_COMPUTE_FORMAT < 0) || (RESOLVED_COMPUTE_FORMAT > 2)) begin
+            $fatal(1, "Unsupported COMPUTE_FORMAT=%0d resolved=%0d", COMPUTE_FORMAT, RESOLVED_COMPUTE_FORMAT);
+        end
+        if ((COMPUTE_FORMAT == 0 || COMPUTE_FORMAT == 2) && MODE_ID52) begin
+            $fatal(1, "MODE_ID52=1 conflicts with explicit COMPUTE_FORMAT=%0d", COMPUTE_FORMAT);
+        end
+        if ((PARALLELISM > IO_LANES) && !ID52_MODE) begin
+            $fatal(1, "PARALLELISM>%0d is only supported for ID52 mode in this version", IO_LANES);
         end
         if ((ID52_METADATA_FORMAT != 1) && (ID52_METADATA_FORMAT != 2)) begin
             $fatal(1, "Unsupported ID52_METADATA_FORMAT=%0d", ID52_METADATA_FORMAT);
         end
-        if ((ID52_METADATA_FORMAT == 2) && ((MODE_ID52 == 1'b0) || (PARALLELISM != 32))) begin
-            $fatal(1, "ID52_METADATA_FORMAT=2 currently requires MODE_ID52=1 and PARALLELISM=32");
+        if ((ID52_METADATA_FORMAT == 2) && (!ID52_MODE || (PARALLELISM != 32))) begin
+            $fatal(1, "ID52_METADATA_FORMAT=2 currently requires ID52 mode and PARALLELISM=32");
         end
-        if (SYMMETRIC_UPPER_ONLY && ((MODE_ID52 == 1'b0) || (PARALLELISM != 16))) begin
-            $fatal(1, "SYMMETRIC_UPPER_ONLY currently requires MODE_ID52=1 and PARALLELISM=16");
+        if (CSR_MODE && (PARALLELISM != IO_LANES)) begin
+            $fatal(1, "CSR Phase 1 requires PARALLELISM=%0d, got %0d", IO_LANES, PARALLELISM);
+        end
+        if (SYMMETRIC_UPPER_ONLY && ((!ID52_MODE) || (PARALLELISM != 16))) begin
+            $fatal(1, "SYMMETRIC_UPPER_ONLY currently requires ID52 mode and PARALLELISM=16");
         end
     end
 `endif
@@ -156,6 +170,9 @@ module top #(
     wire [PARALLELISM*16-1:0]         dec_row_deltas; // 行偏移量数组
     wire [15:0]                       dec_row_base;   // 行基址
     wire [15:0]                       dec_col_base;   // 列基址
+    wire [PARALLELISM*ADDR_WIDTH-1:0] dec_rows_abs;   // 每lane绝对行地址
+    wire [PARALLELISM*ADDR_WIDTH-1:0] dec_cols_abs;   // 每lane绝对列地址
+    wire [PARALLELISM-1:0]            dec_valid_mask; // 每lane有效掩码
     wire                              dec_fifo_empty; // 解码器FIFO空标志
 
     // ========================================================================
@@ -166,7 +183,10 @@ module top #(
     reg [PARALLELISM*16-1:0]          dec_row_deltas_pipe [0:META_OUT_STAGE];
     reg [15:0]                        dec_row_base_pipe [0:META_OUT_STAGE];
     reg [15:0]                        dec_col_base_pipe [0:META_OUT_STAGE];
+    reg [PARALLELISM*ADDR_WIDTH-1:0]  dec_rows_abs_pipe [0:META_OUT_STAGE];
+    reg [PARALLELISM*ADDR_WIDTH-1:0]  dec_cols_abs_pipe [0:META_OUT_STAGE];
     reg [PARALLELISM-1:0]             dec_nonzero_pipe [0:META_OUT_STAGE];
+    reg [PARALLELISM-1:0]             dec_valid_mask_pipe [0:META_OUT_STAGE];
     wire                              acc_ready;
     wire                              acc_idle;
     wire                              dec_ready_out;
@@ -192,7 +212,10 @@ module top #(
                 dec_row_deltas_pipe[pipe_idx] <= {PARALLELISM*16{1'b0}};
                 dec_row_base_pipe[pipe_idx]   <= 16'd0;
                 dec_col_base_pipe[pipe_idx]   <= 16'd0;
+                dec_rows_abs_pipe[pipe_idx]   <= {PARALLELISM*ADDR_WIDTH{1'b0}};
+                dec_cols_abs_pipe[pipe_idx]   <= {PARALLELISM*ADDR_WIDTH{1'b0}};
                 dec_nonzero_pipe[pipe_idx]    <= {PARALLELISM{1'b0}};
+                dec_valid_mask_pipe[pipe_idx] <= {PARALLELISM{1'b0}};
             end
         end else if (state == S_COMPUTE) begin
             compute_inflight_pipe[0] <= compute_fire;
@@ -209,21 +232,30 @@ module top #(
                 dec_row_deltas_pipe[0] <= dec_row_deltas;
                 dec_row_base_pipe[0]   <= dec_row_base;
                 dec_col_base_pipe[0]   <= dec_col_base;
+                dec_rows_abs_pipe[0]   <= dec_rows_abs;
+                dec_cols_abs_pipe[0]   <= dec_cols_abs;
+                dec_valid_mask_pipe[0] <= dec_valid_mask;
                 for (pipe_idx = 0; pipe_idx < PARALLELISM; pipe_idx = pipe_idx + 1) begin
-                    dec_nonzero_pipe[0][pipe_idx] <= (dec_vals[pipe_idx*DATA_WIDTH +: DATA_WIDTH] != {DATA_WIDTH{1'b0}});
+                    dec_nonzero_pipe[0][pipe_idx] <= dec_valid_mask[pipe_idx] && (dec_vals[pipe_idx*DATA_WIDTH +: DATA_WIDTH] != {DATA_WIDTH{1'b0}});
                 end
             end else begin
                 dec_row_deltas_pipe[0] <= {PARALLELISM*16{1'b0}};
                 dec_row_base_pipe[0]   <= 16'd0;
                 dec_col_base_pipe[0]   <= 16'd0;
+                dec_rows_abs_pipe[0]   <= {PARALLELISM*ADDR_WIDTH{1'b0}};
+                dec_cols_abs_pipe[0]   <= {PARALLELISM*ADDR_WIDTH{1'b0}};
                 dec_nonzero_pipe[0]    <= {PARALLELISM{1'b0}};
+                dec_valid_mask_pipe[0] <= {PARALLELISM{1'b0}};
             end
 
             for (pipe_idx = 1; pipe_idx <= META_OUT_STAGE; pipe_idx = pipe_idx + 1) begin
                 dec_row_deltas_pipe[pipe_idx] <= dec_row_deltas_pipe[pipe_idx-1];
                 dec_row_base_pipe[pipe_idx]   <= dec_row_base_pipe[pipe_idx-1];
                 dec_col_base_pipe[pipe_idx]   <= dec_col_base_pipe[pipe_idx-1];
+                dec_rows_abs_pipe[pipe_idx]   <= dec_rows_abs_pipe[pipe_idx-1];
+                dec_cols_abs_pipe[pipe_idx]   <= dec_cols_abs_pipe[pipe_idx-1];
                 dec_nonzero_pipe[pipe_idx]    <= dec_nonzero_pipe[pipe_idx-1];
+                dec_valid_mask_pipe[pipe_idx] <= dec_valid_mask_pipe[pipe_idx-1];
             end
         end else begin
             dec_vals_d1 <= {PARALLELISM*DATA_WIDTH{1'b0}};
@@ -235,7 +267,10 @@ module top #(
                 dec_row_deltas_pipe[pipe_idx] <= {PARALLELISM*16{1'b0}};
                 dec_row_base_pipe[pipe_idx]   <= 16'd0;
                 dec_col_base_pipe[pipe_idx]   <= 16'd0;
+                dec_rows_abs_pipe[pipe_idx]   <= {PARALLELISM*ADDR_WIDTH{1'b0}};
+                dec_cols_abs_pipe[pipe_idx]   <= {PARALLELISM*ADDR_WIDTH{1'b0}};
                 dec_nonzero_pipe[pipe_idx]    <= {PARALLELISM{1'b0}};
+                dec_valid_mask_pipe[pipe_idx] <= {PARALLELISM{1'b0}};
             end
         end
     end
@@ -409,11 +444,33 @@ module top #(
 
     // ========================================================================
     // 解码器实例化
-    // 根据MODE_ID52参数选择解码器类型
     // ========================================================================
+    genvar i;
     generate
-        if (MODE_ID52 == 1'b0) begin : gen_decoder_legacy
-            // 传统模式: 直接传递FP64值, 16拍数据+5拍元数据
+        if (CSR_MODE) begin : gen_decoder_csr
+            assign dec_row_deltas = {PARALLELISM*16{1'b0}};
+            assign dec_row_base = 16'd0;
+            assign dec_col_base = 16'd0;
+            csr_decoder #(
+                .AXI_WIDTH(AXI_WIDTH),
+                .PARALLELISM(PARALLELISM),
+                .DATA_WIDTH(DATA_WIDTH),
+                .ADDR_WIDTH(ADDR_WIDTH)
+            ) u_decoder (
+                .clk(clk),
+                .rst_n(rst_n),
+                .s_axis_tdata(s_axis_tdata),
+                .s_axis_tvalid(axis_to_dec_valid),
+                .s_axis_tready(dec_ready_out),
+                .compute_req_next(compute_req_next),
+                .decoder_valid(decoder_val),
+                .m_vals_data(dec_vals),
+                .m_rows_abs(dec_rows_abs),
+                .m_cols_abs(dec_cols_abs),
+                .m_valid_mask(dec_valid_mask),
+                .o_pipeline_idle(dec_fifo_empty)
+            );
+        end else if (RAW_B8C_MODE) begin : gen_decoder_legacy
             b8c_decoder #(
                 .AXI_WIDTH(AXI_WIDTH),
                 .PARALLELISM(PARALLELISM),
@@ -433,8 +490,14 @@ module top #(
                 .m_col_base(dec_col_base),
                 .o_pipeline_idle(dec_fifo_empty)
             );
+            for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_abs
+                wire [15:0] row_abs = dec_row_base + dec_row_deltas[i*16 +: 16];
+                wire [15:0] col_abs = dec_col_base + i;
+                assign dec_rows_abs[i*ADDR_WIDTH +: ADDR_WIDTH] = row_abs[ADDR_WIDTH-1:0];
+                assign dec_cols_abs[i*ADDR_WIDTH +: ADDR_WIDTH] = col_abs[ADDR_WIDTH-1:0];
+                assign dec_valid_mask[i] = 1'b1;
+            end
         end else begin : gen_decoder_id52
-            // ID压缩模式: 2拍8位ID+5拍元数据, 通过LUT转换为FP64
             b8c_decoder_id52 #(
                 .AXI_WIDTH(AXI_WIDTH),
                 .PARALLELISM(PARALLELISM),
@@ -462,6 +525,13 @@ module top #(
                 .m_col_base(dec_col_base),
                 .o_pipeline_idle(dec_fifo_empty)
             );
+            for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_abs
+                wire [15:0] row_abs = dec_row_base + dec_row_deltas[i*16 +: 16];
+                wire [15:0] col_abs = dec_col_base + i;
+                assign dec_rows_abs[i*ADDR_WIDTH +: ADDR_WIDTH] = row_abs[ADDR_WIDTH-1:0];
+                assign dec_cols_abs[i*ADDR_WIDTH +: ADDR_WIDTH] = col_abs[ADDR_WIDTH-1:0];
+                assign dec_valid_mask[i] = 1'b1;
+            end
         end
     endgenerate
 
@@ -469,11 +539,10 @@ module top #(
     // X存储器地址映射
     // col_base用于计算X向量的读取地址
     // ========================================================================
-    genvar i;
     generate
         for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_x_addr
-            // 主路径: 列基址 + 通道偏移, 右移得到bank地址
-            assign x_rd_addr_mapped[i*ADDR_WIDTH +: ADDR_WIDTH] = (dec_col_base_pipe[0] + i) >> COL_SHIFT;
+            wire [ADDR_WIDTH-1:0] col_addr_p = dec_cols_abs_pipe[0][i*ADDR_WIDTH +: ADDR_WIDTH];
+            assign x_rd_addr_mapped[i*ADDR_WIDTH +: ADDR_WIDTH] = col_addr_p >> COL_SHIFT;
         end
     endgenerate
 
@@ -483,10 +552,9 @@ module top #(
     // ========================================================================
     generate
         for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_x_sym_addr
-            wire [15:0] sym_delta = dec_row_deltas_pipe[0][i*16 +: 16];
-            wire [15:0] sym_row_abs = dec_row_base_pipe[0] + sym_delta;
-            // 对称路径使用全局地址索引
-            assign x_sym_rd_addr_global[i*X_GLOBAL_AW +: X_GLOBAL_AW] = sym_row_abs[X_GLOBAL_AW-1:0];
+            wire [ADDR_WIDTH-1:0] sym_row_abs = dec_rows_abs_pipe[0][i*ADDR_WIDTH +: ADDR_WIDTH];
+            wire [X_GLOBAL_AW-1:0] sym_row_global = sym_row_abs;
+            assign x_sym_rd_addr_global[i*X_GLOBAL_AW +: X_GLOBAL_AW] = sym_row_global;
         end
     endgenerate
 
@@ -565,6 +633,7 @@ module top #(
     ) u_compute (
         .clk(clk),
         .in_valid(compute_valid_d2),
+        .lane_valid_mask(dec_valid_mask_pipe[1]),
         .matrix_values(dec_vals_d2),         // 矩阵元素值，与 X 读数据对齐
         .x_values_main(x_rd_data),           // X向量值(主路径)
         .x_values_sym(x_sym_rd_data),        // X向量值(对称路径)
@@ -602,44 +671,40 @@ module top #(
     wire [PARALLELISM-1:0]            pp_valid_sym_masked; // 对称路径最终有效掩码
     generate
         for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_y_addr
-            wire [15:0] delta_p = dec_row_deltas[i*16 +: 16];
-            wire [15:0] row_abs_p = dec_row_base + delta_p;
-            wire [15:0] col_abs_p = dec_col_base + i;
-            wire [15:0] delta_d = dec_row_deltas_pipe[META_OUT_STAGE][i*16 +: 16];
-            wire [15:0] row_abs_d = dec_row_base_pipe[META_OUT_STAGE] + delta_d;  // 绝对行地址
-            wire [15:0] col_abs_d = dec_col_base_pipe[META_OUT_STAGE] + i;         // 绝对列地址
-            wire        dec_nonzero_p = (dec_vals[i*DATA_WIDTH +: DATA_WIDTH] != {DATA_WIDTH{1'b0}});
-            assign y_preview_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = row_abs_p[ADDR_WIDTH-1:0];
-            assign y_preview_addr_sym[i*ADDR_WIDTH +: ADDR_WIDTH] = col_abs_p[ADDR_WIDTH-1:0];
+            wire [ADDR_WIDTH-1:0] row_abs_p = dec_rows_abs[i*ADDR_WIDTH +: ADDR_WIDTH];
+            wire [ADDR_WIDTH-1:0] col_abs_p = dec_cols_abs[i*ADDR_WIDTH +: ADDR_WIDTH];
+            wire [ADDR_WIDTH-1:0] row_abs_d = dec_rows_abs_pipe[META_OUT_STAGE][i*ADDR_WIDTH +: ADDR_WIDTH];
+            wire [ADDR_WIDTH-1:0] col_abs_d = dec_cols_abs_pipe[META_OUT_STAGE][i*ADDR_WIDTH +: ADDR_WIDTH];
+            wire        dec_nonzero_p = dec_valid_mask[i] && (dec_vals[i*DATA_WIDTH +: DATA_WIDTH] != {DATA_WIDTH{1'b0}});
+            assign y_preview_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = row_abs_p;
+            assign y_preview_addr_sym[i*ADDR_WIDTH +: ADDR_WIDTH] = col_abs_p;
             assign y_preview_valid[i] =
-                CONTINUOUS_ISSUE_MODE ? decoder_val :
+                CONTINUOUS_ISSUE_MODE ? (decoder_val && dec_valid_mask[i]) :
                 (SYMM_CONTINUOUS_ISSUE_MODE && decoder_val && dec_nonzero_p && (row_abs_p < Y_ELEMS));
             assign y_preview_valid_sym[i] =
                 SYMM_CONTINUOUS_ISSUE_MODE && decoder_val &&
                 dec_nonzero_p &&
                 (row_abs_p != col_abs_p) &&
                 (col_abs_p < Y_ELEMS);
-            // 主路径: 按行累加 Y[row] += A[row,col] * X[col]
-            assign y_compute_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = row_abs_d[ADDR_WIDTH-1:0];
-            // 对称路径: 按列累加 Y[col] += A[row,col] * X[row] (利用对称性)
-            assign y_compute_addr_sym[i*ADDR_WIDTH +: ADDR_WIDTH] = col_abs_d[ADDR_WIDTH-1:0];
-            // 对角线检测: 行列相等时跳过对称路径
+            assign y_compute_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = row_abs_d;
+            assign y_compute_addr_sym[i*ADDR_WIDTH +: ADDR_WIDTH] = col_abs_d;
             assign y_sym_diag_mask[i] = (row_abs_d == col_abs_d);
         end
     endgenerate
 
     generate
         for (i = 0; i < PARALLELISM; i = i + 1) begin : gen_sym_valid_mask
-            wire [15:0] delta_d = dec_row_deltas_pipe[META_OUT_STAGE][i*16 +: 16];
-            wire [15:0] row_abs_d = dec_row_base_pipe[META_OUT_STAGE] + delta_d;
-            wire [15:0] col_abs_d = dec_col_base_pipe[META_OUT_STAGE] + i;
+            wire [ADDR_WIDTH-1:0] row_abs_d = dec_rows_abs_pipe[META_OUT_STAGE][i*ADDR_WIDTH +: ADDR_WIDTH];
+            wire [ADDR_WIDTH-1:0] col_abs_d = dec_cols_abs_pipe[META_OUT_STAGE][i*ADDR_WIDTH +: ADDR_WIDTH];
             assign pp_valid_main_acc[i] =
                 pp_valid_main[i] &
+                dec_valid_mask_pipe[META_OUT_STAGE][i] &
                 (!SYMM_CONTINUOUS_ISSUE_MODE ||
                  (dec_nonzero_pipe[META_OUT_STAGE][i] && (row_abs_d < Y_ELEMS)));
             assign pp_valid_sym_masked[i] =
                 pp_valid_sym[i] &
                 SYMMETRIC_UPPER_ONLY &
+                dec_valid_mask_pipe[META_OUT_STAGE][i] &
                 dec_nonzero_pipe[META_OUT_STAGE][i] &
                 ~y_sym_diag_mask[i] &
                 (!SYMM_CONTINUOUS_ISSUE_MODE || (col_abs_d < Y_ELEMS));

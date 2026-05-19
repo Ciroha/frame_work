@@ -175,4 +175,99 @@ module b8c_decoder #(
     // 流水线空闲: 无待读数据且无已对齐待消费的数据
     assign o_pipeline_idle = val_empty && !val_stage_valid;
 
+`ifndef SYNTHESIS
+    reg stats_active;
+    reg stats_reported;
+    reg [31:0] id_empty_cycles;
+    reg [31:0] id_full_cycles;
+    reg [31:0] meta_empty_cycles;
+    reg [31:0] meta_full_cycles;
+    reg [31:0] pair_wait_cycles;
+    reg [31:0] consume_cycles;
+    reg [31:0] decoder_valid_cycles;
+    reg [31:0] compute_req_cycles;
+    reg [31:0] compute_backpressure_cycles;
+    reg [31:0] no_decoder_valid_cycles;
+    reg [31:0] both_ready_cycles;
+    reg [31:0] both_empty_cycles;
+    reg [31:0] id_only_wait_cycles;
+    reg [31:0] meta_only_wait_cycles;
+    reg [31:0] id_q_occupancy_sum;
+    reg [31:0] meta_q_occupancy_sum;
+    reg [31:0] id_q_occupancy_max;
+    reg [31:0] meta_q_occupancy_max;
+
+    wire stats_start = val_wen || meta_wen;
+    wire stats_id_empty = val_empty && !val_stage_valid;
+    wire stats_id_full = val_full;
+    wire stats_meta_empty = !parser_ready;
+    wire stats_meta_full = meta_full;
+    wire stats_pair_wait = stats_id_empty ^ stats_meta_empty;
+    wire stats_decoder_valid = decoder_valid;
+    wire stats_consume = decoder_consume;
+    wire stats_both_ready = !stats_id_empty && !stats_meta_empty;
+    wire stats_both_empty = stats_id_empty && stats_meta_empty;
+    wire stats_id_only_wait = !stats_id_empty && stats_meta_empty;
+    wire stats_meta_only_wait = stats_id_empty && !stats_meta_empty;
+    wire stats_compute_backpressure = decoder_valid && !compute_req_next;
+    wire stats_done = stats_active && !stats_reported && o_pipeline_idle && !s_axis_tvalid;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            stats_active <= 1'b0;
+            stats_reported <= 1'b0;
+            id_empty_cycles <= 32'd0;
+            id_full_cycles <= 32'd0;
+            meta_empty_cycles <= 32'd0;
+            meta_full_cycles <= 32'd0;
+            pair_wait_cycles <= 32'd0;
+            consume_cycles <= 32'd0;
+            decoder_valid_cycles <= 32'd0;
+            compute_req_cycles <= 32'd0;
+            compute_backpressure_cycles <= 32'd0;
+            no_decoder_valid_cycles <= 32'd0;
+            both_ready_cycles <= 32'd0;
+            both_empty_cycles <= 32'd0;
+            id_only_wait_cycles <= 32'd0;
+            meta_only_wait_cycles <= 32'd0;
+            id_q_occupancy_sum <= 32'd0;
+            meta_q_occupancy_sum <= 32'd0;
+            id_q_occupancy_max <= 32'd0;
+            meta_q_occupancy_max <= 32'd0;
+        end else begin
+            if (stats_start && !stats_active && !stats_reported) begin
+                stats_active <= 1'b1;
+            end
+
+            if (stats_active && !stats_done) begin
+                if (stats_id_empty) id_empty_cycles <= id_empty_cycles + 1'b1;
+                if (stats_id_full) id_full_cycles <= id_full_cycles + 1'b1;
+                if (stats_meta_empty) meta_empty_cycles <= meta_empty_cycles + 1'b1;
+                if (stats_meta_full) meta_full_cycles <= meta_full_cycles + 1'b1;
+                if (stats_pair_wait) pair_wait_cycles <= pair_wait_cycles + 1'b1;
+                if (stats_consume) consume_cycles <= consume_cycles + 1'b1;
+                if (stats_decoder_valid) decoder_valid_cycles <= decoder_valid_cycles + 1'b1;
+                if (compute_req_next) compute_req_cycles <= compute_req_cycles + 1'b1;
+                if (stats_compute_backpressure) compute_backpressure_cycles <= compute_backpressure_cycles + 1'b1;
+                if (!stats_decoder_valid) no_decoder_valid_cycles <= no_decoder_valid_cycles + 1'b1;
+                if (stats_both_ready) both_ready_cycles <= both_ready_cycles + 1'b1;
+                if (stats_both_empty) both_empty_cycles <= both_empty_cycles + 1'b1;
+                if (stats_id_only_wait) id_only_wait_cycles <= id_only_wait_cycles + 1'b1;
+                if (stats_meta_only_wait) meta_only_wait_cycles <= meta_only_wait_cycles + 1'b1;
+            end
+
+            if (stats_done) begin
+                stats_active <= 1'b0;
+                stats_reported <= 1'b1;
+                $display("DEC_STATS id_empty=%0d id_full=%0d meta_empty=%0d meta_full=%0d pair_wait=%0d consume=%0d",
+                         id_empty_cycles, id_full_cycles, meta_empty_cycles, meta_full_cycles, pair_wait_cycles, consume_cycles);
+                $display("DEC_DETAIL_STATS decoder_valid=%0d compute_req=%0d compute_backpressure=%0d no_decoder_valid=%0d both_ready=%0d both_empty=%0d id_only_wait=%0d meta_only_wait=%0d id_q_sum=%0d meta_q_sum=%0d id_q_max=%0d meta_q_max=%0d",
+                         decoder_valid_cycles, compute_req_cycles, compute_backpressure_cycles, no_decoder_valid_cycles,
+                         both_ready_cycles, both_empty_cycles, id_only_wait_cycles, meta_only_wait_cycles,
+                         id_q_occupancy_sum, meta_q_occupancy_sum, id_q_occupancy_max, meta_q_occupancy_max);
+            end
+        end
+    end
+`endif
+
 endmodule
