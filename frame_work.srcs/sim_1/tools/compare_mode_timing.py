@@ -97,6 +97,22 @@ def set_tb_param(tb_file: Path, param_name: str, value: str) -> None:
     tb_file.write_text(new_txt, encoding="utf-8")
 
 
+def apply_audit_int_default(
+    args: argparse.Namespace,
+    audit_path: Path,
+    attr: str,
+    key: str,
+    value: int,
+) -> None:
+    current = getattr(args, attr)
+    if current is None:
+        setattr(args, attr, value)
+    elif int(current) != value:
+        raise ValueError(
+            f"--{attr.replace('_', '-')}={current} does not match {audit_path} {key}={value}"
+        )
+
+
 def apply_artifact_audit_defaults(args: argparse.Namespace) -> None:
     if args.data_dir is None:
         return
@@ -106,22 +122,24 @@ def apply_artifact_audit_defaults(args: argparse.Namespace) -> None:
         return
 
     audit = json.loads(audit_path.read_text(encoding="utf-8"))
+    x_length = audit.get("x_length") or audit.get("cols")
+    if x_length is not None:
+        parallelism = int(args.parallelism)
+        value = (int(x_length) + parallelism - 1) // parallelism
+        apply_audit_int_default(args, audit_path, "vector_depth", "x_length/parallelism", value)
+    else:
+        value = audit.get("vector_depth")
+        if value is not None:
+            apply_audit_int_default(args, audit_path, "vector_depth", "vector_depth", int(value))
+
     for attr, key in (
-        ("vector_depth", "vector_depth"),
         ("y_elems", "y_elems"),
         ("mat_data_beats", "mat_data_beats"),
     ):
         value = audit.get(key)
         if value is None:
             continue
-        value = int(value)
-        current = getattr(args, attr)
-        if current is None:
-            setattr(args, attr, value)
-        elif int(current) != value:
-            raise ValueError(
-                f"--{attr.replace('_', '-')}={current} does not match {audit_path} {key}={value}"
-            )
+        apply_audit_int_default(args, audit_path, attr, key, int(value))
 
 
 def parse_log(mode: int, sim_log: Path) -> SimMetrics:
@@ -301,6 +319,15 @@ def safe_div(num: float | int | None, den: float | int | None) -> float | None:
 
 def process_exists(pid: int) -> bool:
     if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        handle = ctypes.windll.kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if handle:
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
         return False
     try:
         os.kill(pid, 0)
@@ -654,6 +681,21 @@ def main() -> None:
         help="enable simulation-only normalized Layer 1 per-cycle trace lines",
     )
     ap.add_argument(
+        "--enable-bank-stats",
+        action="store_true",
+        help="enable simulation-only bank conflict summary diagnostics",
+    )
+    ap.add_argument(
+        "--enable-stall-reason-stats",
+        action="store_true",
+        help="enable simulation-only stall reason diagnostics",
+    )
+    ap.add_argument(
+        "--run-ns",
+        default=None,
+        help="optional xsim run duration for a temporary tclbatch, for example 2000000ns",
+    )
+    ap.add_argument(
         "--id52-sweep",
         action="store_true",
         help="run an ID52-only sweep over decouple/depth options and write a CSV",
@@ -869,6 +911,8 @@ def main() -> None:
                 set_tb_param(tb_file, "PARALLELISM", str(args.parallelism))
                 set_tb_param(tb_file, "SYMMETRIC_UPPER_ONLY", f"1'b{args.symmetric_upper_only}")
                 set_tb_param(tb_file, "ID52_METADATA_FORMAT", "2" if args.metadata_format == "v2" else "1")
+                set_tb_param(tb_file, "SIM_ENABLE_BANK_STATS", "1'b1" if args.enable_bank_stats else "1'b0")
+                set_tb_param(tb_file, "SIM_ENABLE_STALL_REASON_STATS", "1'b1" if args.enable_stall_reason_stats else "1'b0")
                 if args.vector_depth is not None:
                     set_tb_param(tb_file, "VECTOR_DEPTH", str(args.vector_depth))
                 if args.y_elems is not None:
@@ -901,6 +945,11 @@ def main() -> None:
                 xvlog_log = f"xvlog_{args.prefix}_m{mode}.log"
                 elab_log = f"elaborate_{args.prefix}_m{mode}.log"
                 sim_log = f"simulate_{args.prefix}_m{mode}.log"
+                tclbatch = "tb_b8c_top_ram.tcl"
+                if args.run_ns is not None:
+                    tclbatch_path = xsim_dir / f"tb_b8c_top_ram_{args.prefix}_m{mode}.tcl"
+                    tclbatch_path.write_text(f"run {args.run_ns}\nquit\n", encoding="utf-8")
+                    tclbatch = tclbatch_path.name
 
                 run_cmd(
                     [
@@ -965,7 +1014,7 @@ def main() -> None:
                         str(xsim_bat),
                         snapshot,
                         "-tclbatch",
-                        "tb_b8c_top_ram.tcl",
+                        tclbatch,
                         "-log",
                         sim_log,
                     ],

@@ -28,7 +28,9 @@ module b8c_decoder #(
     parameter AXI_WIDTH   = 512,   // HBM接口位宽(512位)
     parameter PARALLELISM = 8,     // 并行度(C=8, 8个并行计算通道)
     parameter VAL_BATCH   = 16,    // 数值批大小(16拍FP64数据)
-    parameter META_BATCH  = 5      // 元数据批大小(5拍元数据)
+    parameter META_BATCH  = 5,     // 元数据批大小(5拍元数据)
+    parameter DECOUPLE_VAL_META = 1'b0,
+    parameter TOKEN_Q_DEPTH = 8
 )(
     input  wire                   clk,
     input  wire                   rst_n,
@@ -75,6 +77,18 @@ module b8c_decoder #(
     reg [PARALLELISM*16-1:0]  meta_row_delta_stage;    // 与val_fifo_dout对齐的行偏移
     wire                      decoder_consume;
     wire                      val_issue_read;
+    localparam TOKEN_W = AXI_WIDTH + PARALLELISM*16 + 32;
+    localparam TOKEN_Q_AW = (TOKEN_Q_DEPTH <= 1) ? 1 : $clog2(TOKEN_Q_DEPTH);
+    localparam TOKEN_Q_CW = $clog2(TOKEN_Q_DEPTH + 1);
+    reg [TOKEN_W-1:0] token_queue [0:TOKEN_Q_DEPTH-1];
+    reg [TOKEN_Q_AW-1:0] token_q_wptr, token_q_rptr;
+    reg [TOKEN_Q_CW-1:0] token_q_count;
+    wire token_q_empty = (token_q_count == 0);
+    wire token_q_full = (token_q_count == TOKEN_Q_DEPTH);
+    wire token_q_pop;
+    wire token_q_push;
+    wire [TOKEN_W-1:0] token_pack;
+    wire [TOKEN_W-1:0] token_head;
 
     // =========================================================
     // 子模块1: 流解复用器 (16数据 : 5元数据)
@@ -138,9 +152,11 @@ module b8c_decoder #(
     // =========================================================
     // simple_sync_fifo 读口有1拍延迟；因此需要把 metadata 先暂存一拍，
     // 再与下一拍出现的 val_fifo_dout 对齐输出。
-    assign decoder_valid = val_stage_valid;
+    assign decoder_valid = DECOUPLE_VAL_META ? !token_q_empty : val_stage_valid;
     assign decoder_consume = compute_req_next && decoder_valid;
-    assign val_issue_read = parser_ready && !val_empty && (!val_stage_valid || decoder_consume);
+    assign token_q_pop = DECOUPLE_VAL_META && decoder_consume;
+    assign token_q_push = DECOUPLE_VAL_META && val_stage_valid && (!token_q_full || token_q_pop);
+    assign val_issue_read = parser_ready && !val_empty && (!val_stage_valid || (DECOUPLE_VAL_META ? token_q_push : decoder_consume));
 
     // 当需要装填新的对齐拍时，读取FIFO并推进解析器。
     assign val_ren = val_issue_read;
@@ -158,7 +174,7 @@ module b8c_decoder #(
                 meta_row_delta_stage <= parser_row_delta;
             end
 
-            if (val_stage_valid && !decoder_consume && !val_issue_read) begin
+            if (val_stage_valid && !(DECOUPLE_VAL_META ? token_q_push : decoder_consume) && !val_issue_read) begin
                 val_stage_valid <= 1'b1;
             end else begin
                 val_stage_valid <= val_issue_read;
@@ -166,14 +182,46 @@ module b8c_decoder #(
         end
     end
 
+    assign token_pack = {val_fifo_dout, meta_row_delta_stage, meta_col_base_stage, meta_row_base_stage};
+    assign token_head = token_q_empty ? {TOKEN_W{1'b0}} : token_queue[token_q_rptr];
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            token_q_wptr <= {TOKEN_Q_AW{1'b0}};
+            token_q_rptr <= {TOKEN_Q_AW{1'b0}};
+            token_q_count <= {TOKEN_Q_CW{1'b0}};
+        end else if (DECOUPLE_VAL_META) begin
+            if (token_q_push) begin
+                token_queue[token_q_wptr] <= token_pack;
+                if (token_q_wptr == TOKEN_Q_DEPTH-1) begin
+                    token_q_wptr <= {TOKEN_Q_AW{1'b0}};
+                end else begin
+                    token_q_wptr <= token_q_wptr + 1'b1;
+                end
+            end
+            if (token_q_pop) begin
+                if (token_q_rptr == TOKEN_Q_DEPTH-1) begin
+                    token_q_rptr <= {TOKEN_Q_AW{1'b0}};
+                end else begin
+                    token_q_rptr <= token_q_rptr + 1'b1;
+                end
+            end
+            case ({token_q_push, token_q_pop})
+                2'b10: token_q_count <= token_q_count + 1'b1;
+                2'b01: token_q_count <= token_q_count - 1'b1;
+                default: token_q_count <= token_q_count;
+            endcase
+        end
+    end
+
     // 输出赋值
-    assign m_vals_data = val_fifo_dout;             // 数值来自FIFO读出结果
-    assign m_row_deltas = meta_row_delta_stage;     // 行偏移与数值对齐
-    assign m_row_base   = meta_row_base_stage;      // 行基址与数值对齐
-    assign m_col_base   = meta_col_base_stage;      // 列基址与数值对齐
+    assign m_vals_data = DECOUPLE_VAL_META ? token_head[TOKEN_W-1 -: AXI_WIDTH] : val_fifo_dout;
+    assign m_row_deltas = DECOUPLE_VAL_META ? token_head[PARALLELISM*16+31:32] : meta_row_delta_stage;
+    assign m_row_base   = DECOUPLE_VAL_META ? token_head[15:0] : meta_row_base_stage;
+    assign m_col_base   = DECOUPLE_VAL_META ? token_head[31:16] : meta_col_base_stage;
 
     // 流水线空闲: 无待读数据且无已对齐待消费的数据
-    assign o_pipeline_idle = val_empty && !val_stage_valid;
+    assign o_pipeline_idle = val_empty && !val_stage_valid && (!DECOUPLE_VAL_META || token_q_empty);
 
 `ifndef SYNTHESIS
     reg stats_active;

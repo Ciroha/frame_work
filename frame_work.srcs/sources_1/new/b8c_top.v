@@ -106,7 +106,8 @@ module top #(
     localparam SYMM_CONTINUOUS_ISSUE_MODE = ID52_MODE &&
                                             (PARALLELISM == 16) &&
                                             SYMMETRIC_UPPER_ONLY;
-    localparam CONTINUOUS_ADMISSION_MODE = CONTINUOUS_ISSUE_MODE || SYMM_CONTINUOUS_ISSUE_MODE;
+    localparam RAW_CONTINUOUS_ISSUE_MODE = RAW_B8C_MODE && DECOUPLE_ID_META && !SYMMETRIC_UPPER_ONLY;
+    localparam CONTINUOUS_ADMISSION_MODE = CONTINUOUS_ISSUE_MODE || SYMM_CONTINUOUS_ISSUE_MODE || RAW_CONTINUOUS_ISSUE_MODE;
     localparam integer IO_LANES = AXI_WIDTH / DATA_WIDTH;  // 每拍传输的数据个数(8)
     localparam integer LANE_RATIO = PARALLELISM / IO_LANES; // 并行度与IO比例(1或2)
     localparam integer X_AXI_BEATS = VECTOR_DEPTH * LANE_RATIO; // X向量传输拍数
@@ -475,7 +476,9 @@ module top #(
                 .AXI_WIDTH(AXI_WIDTH),
                 .PARALLELISM(PARALLELISM),
                 .VAL_BATCH(16),
-                .META_BATCH(5)
+                .META_BATCH(5),
+                .DECOUPLE_VAL_META(DECOUPLE_ID_META),
+                .TOKEN_Q_DEPTH(ID_Q_DEPTH)
             ) u_decoder (
                 .clk(clk),
                 .rst_n(rst_n),
@@ -679,7 +682,7 @@ module top #(
             assign y_preview_addr[i*ADDR_WIDTH +: ADDR_WIDTH] = row_abs_p;
             assign y_preview_addr_sym[i*ADDR_WIDTH +: ADDR_WIDTH] = col_abs_p;
             assign y_preview_valid[i] =
-                CONTINUOUS_ISSUE_MODE ? (decoder_val && dec_valid_mask[i]) :
+                (CONTINUOUS_ISSUE_MODE || RAW_CONTINUOUS_ISSUE_MODE) ? (decoder_val && dec_valid_mask[i]) :
                 (SYMM_CONTINUOUS_ISSUE_MODE && decoder_val && dec_nonzero_p && (row_abs_p < Y_ELEMS));
             assign y_preview_valid_sym[i] =
                 SYMM_CONTINUOUS_ISSUE_MODE && decoder_val &&

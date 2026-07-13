@@ -2,11 +2,14 @@
 
 module tb_b8c_top_ram();
 
+    parameter int METHOD_SELECT = 1;  // 0=B8C, 1=ID52
+    parameter int MATRIX_SELECT = 2;  // 0=CollegeMsg, 1=watt_2, 2=Chebyshev2
+
     parameter AXI_WIDTH    = 512;
-    parameter PARALLELISM  = 8;
-    parameter MODE_ID52    = 1'b1;
-    parameter COMPUTE_FORMAT = 1;
-    parameter ID52_METADATA_FORMAT = 1;
+    parameter PARALLELISM  = (METHOD_SELECT == 1 && MATRIX_SELECT != 0) ? 32 : 8;
+    parameter MODE_ID52    = (METHOD_SELECT == 1) ? 1'b1 : 1'b0;
+    parameter COMPUTE_FORMAT = (METHOD_SELECT == 1) ? 1 : 0;
+    parameter ID52_METADATA_FORMAT = (METHOD_SELECT == 1 && MATRIX_SELECT != 0) ? 2 : 1;
     parameter SYMMETRIC_UPPER_ONLY = 1'b0;
     parameter SIM_USE_MUL_IP = 1'b1;
     parameter SIM_USE_ADD_IP = 1'b1;
@@ -17,13 +20,18 @@ module tb_b8c_top_ram();
     parameter SIM_PRINT_BATCH_BANK_STATS = 1'b0;
     parameter SIM_ENABLE_STALL_REASON_STATS = 1'b0;
     parameter SIM_ENABLE_LAYER1_TRACE = 1'b0;
-    parameter DECOUPLE_ID_META = 1'b0;
-    parameter ID_Q_DEPTH   = 8;
+    parameter DECOUPLE_ID_META = 1'b1;
+    parameter ID_Q_DEPTH   = 64;
     parameter META_Q_DEPTH = 8;
     parameter real Y_ABS_TOL = 1e-9;
-    parameter VECTOR_DEPTH = 1899;
-    parameter Y_ELEMS      = 1899;
-    parameter MAT_DATA_BEATS = 7872;
+    parameter VECTOR_DEPTH = (MATRIX_SELECT == 0) ? 238 :
+                             (MATRIX_SELECT == 1) ? ((METHOD_SELECT == 1) ? 58 : 232) :
+                             ((METHOD_SELECT == 1) ? 65 : 257);
+    parameter Y_ELEMS      = (MATRIX_SELECT == 0) ? 1899 :
+                             (MATRIX_SELECT == 1) ? 1856 : 2053;
+    parameter MAT_DATA_BEATS = (MATRIX_SELECT == 0) ? 7872 :
+                               (MATRIX_SELECT == 1) ? ((METHOD_SELECT == 1) ? 448 : 1552) :
+                               ((METHOD_SELECT == 1) ? 588 : 2320);
     localparam IO_LANES       = AXI_WIDTH / 64;
     localparam LANE_RATIO     = PARALLELISM / IO_LANES;
     localparam MAX_ADDR_ELEMS = (VECTOR_DEPTH > Y_ELEMS) ? VECTOR_DEPTH : Y_ELEMS;
@@ -48,13 +56,17 @@ module tb_b8c_top_ram();
     localparam COMPUTE_STREAM_MEM_BEATS_ID = (COMPUTE_BEATS > COMPUTE_ID_BEATS) ? COMPUTE_BEATS : COMPUTE_ID_BEATS;
     localparam COMPUTE_STREAM_MEM_BEATS = (COMPUTE_STREAM_MEM_BEATS_ID > CSR_COMPUTE_BEATS) ? COMPUTE_STREAM_MEM_BEATS_ID : CSR_COMPUTE_BEATS;
 
-    parameter string X_STREAM_FILE       = "C:/IC/FPGA/frame_work/.omc/tmp_collegemsg_exact/x_stream.hex";
-    parameter string Y_STREAM_FILE       = "C:/IC/FPGA/frame_work/.omc/tmp_collegemsg_exact/y_stream.hex";
-    parameter string COMPUTE_STREAM_FILE = "C:/IC/FPGA/frame_work/.omc/tmp_collegemsg_exact/compute_stream.hex";
-    parameter string COMPUTE_ID_STREAM_FILE = "C:/IC/FPGA/frame_work/.omc/tmp_collegemsg_exact/compute_id_stream.hex";
-    parameter string CSR_STREAM_FILE     = "C:/IC/FPGA/frame_work/.omc/tmp_collegemsg_exact/csr_stream.hex";
-    parameter string LUT_FILE            = "C:/IC/FPGA/frame_work/.omc/tmp_collegemsg_exact/lut.hex";
-    parameter string GOLDEN_Y_FILE       = "C:/IC/FPGA/frame_work/.omc/tmp_collegemsg_exact/golden_y.hex";
+    localparam string MATRIX_DATA_ROOT = "../../../../matrix";
+    localparam string SELECTED_DATA_DIR = (MATRIX_SELECT == 0) ? {MATRIX_DATA_ROOT, "/tmp_collegemsg_exact"} :
+                                          (MATRIX_SELECT == 1) ? ((METHOD_SELECT == 1) ? {MATRIX_DATA_ROOT, "/tmp_watt2_clustered_p32_v2"} : {MATRIX_DATA_ROOT, "/tmp_watt2_raw_b8c_m0"}) :
+                                          ((METHOD_SELECT == 1) ? {MATRIX_DATA_ROOT, "/tmp_cheb_clustered_p32_v2"} : {MATRIX_DATA_ROOT, "/tmp_chebyshev2_raw_b8c_m0"});
+    parameter string X_STREAM_FILE       = {SELECTED_DATA_DIR, "/x_stream.hex"};
+    parameter string Y_STREAM_FILE       = {SELECTED_DATA_DIR, "/y_stream.hex"};
+    parameter string COMPUTE_STREAM_FILE = {SELECTED_DATA_DIR, "/compute_stream.hex"};
+    parameter string COMPUTE_ID_STREAM_FILE = {SELECTED_DATA_DIR, "/compute_id_stream.hex"};
+    parameter string CSR_STREAM_FILE     = {SELECTED_DATA_DIR, "/csr_stream.hex"};
+    parameter string LUT_FILE            = {SELECTED_DATA_DIR, "/lut.hex"};
+    parameter string GOLDEN_Y_FILE       = {SELECTED_DATA_DIR, "/golden_y.hex"};
 
     localparam [63:0] FP64_1_0 = 64'h3FF0_0000_0000_0000;
     localparam [63:0] FP64_2_0 = 64'h4000_0000_0000_0000;
@@ -169,10 +181,11 @@ module tb_b8c_top_ram();
                    MAT_DATA_BEATS, META_EMIT_BEATS);
         end
 
+        $display("TB_SELECT METHOD_SELECT=%0d MATRIX_SELECT=%0d DATA_DIR=%s", METHOD_SELECT, MATRIX_SELECT, SELECTED_DATA_DIR);
         $display("TB_CONFIG AXI_WIDTH=%0d PARALLELISM=%0d MODE_ID52=%0d COMPUTE_FORMAT=%0d RESOLVED_COMPUTE_FORMAT=%0d ID52_METADATA_FORMAT=%0d META_EMIT_BEATS=%0d META_PHYS_BATCH=%0d SYMMETRIC_UPPER_ONLY=%0d SIM_USE_MUL_IP=%0d SIM_USE_ADD_IP=%0d",
                  AXI_WIDTH, PARALLELISM, MODE_ID52, COMPUTE_FORMAT, RESOLVED_COMPUTE_FORMAT, ID52_METADATA_FORMAT, META_EMIT_BEATS, META_PHYS_BATCH, SYMMETRIC_UPPER_ONLY, SIM_USE_MUL_IP, SIM_USE_ADD_IP);
-        $display("TB_CONFIG Y_QUEUE_DEPTH=%0d Y_LIMITED_BYPASS_WINDOW=%0d Y_ISSUE_WINDOW=%0d ID_Q_DEPTH=%0d META_Q_DEPTH=%0d Y_ABS_TOL=%0.12e",
-                 Y_QUEUE_DEPTH, Y_LIMITED_BYPASS_WINDOW, Y_ISSUE_WINDOW, ID_Q_DEPTH, META_Q_DEPTH, Y_ABS_TOL);
+        $display("TB_CONFIG VECTOR_DEPTH=%0d Y_ELEMS=%0d MAT_DATA_BEATS=%0d Y_QUEUE_DEPTH=%0d Y_LIMITED_BYPASS_WINDOW=%0d Y_ISSUE_WINDOW=%0d ID_Q_DEPTH=%0d META_Q_DEPTH=%0d Y_ABS_TOL=%0.12e",
+                 VECTOR_DEPTH, Y_ELEMS, MAT_DATA_BEATS, Y_QUEUE_DEPTH, Y_LIMITED_BYPASS_WINDOW, Y_ISSUE_WINDOW, ID_Q_DEPTH, META_Q_DEPTH, Y_ABS_TOL);
         $display("TB_FILES X=%s", X_STREAM_FILE);
         $display("TB_FILES Y=%s", Y_STREAM_FILE);
         if (CSR_MODE) begin
